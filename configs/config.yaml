@@ -1,0 +1,46 @@
+docker:
+  hosts:
+    - "unix:///var/run/docker.sock"
+  include_patterns:
+    - "*"
+  since: "0s"
+
+filters:
+  warn_match:
+    keywords:
+      - "WARN"
+      - "ERROR"
+    json_fields:
+      - "level"
+    message_fields:
+      - "message"
+      - "msg"
+      - "log"
+    time_fields:
+      - "ts"
+  log_id_extract:
+    json_keys:
+      - "id"
+    regexps:
+      - '(?i)\bid["''=:\s]+([A-Za-z0-9._:-]+)'
+      - '(?i)\brequest[_-]?id["''=:\s]+([A-Za-z0-9._:-]+)'
+      - '(?i)\blog[_-]?id["''=:\s]+([A-Za-z0-9._:-]+)'
+      - '(?i)\balert[_-]?id["''=:\s]+([A-Za-z0-9._:-]+)'
+      - '(?i)\btrace[_-]?id["''=:\s]+([A-Za-z0-9._:-]+)'
+
+aggregation:
+  flush_size: 20
+  flush_interval: "10s"
+  unknown_log_id: "unknown"
+
+dingtalk:
+  webhook_url: ""
+  secret: ""
+  mention_levels:
+    - "ERROR"
+  at_mobiles:
+    - ""
+  at_all: false
+
+storage:
+  output_dir: "data"
