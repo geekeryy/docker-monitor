@@ -64,10 +64,26 @@
 
 ## 快速体验
 
-```bash
-docker run -d --rm  -v /var/run/docker.sock:/var/run/docker.sock  -v "$(pwd)/data:/app/data"  docker.io/geekeryy/docker-monitor:latest
+### 1. 运行监控程序
 
-docker run -it --rm --name monitor_test alpine:latest echo "id=1 WARN test"
+```bash
+docker run -d --rm  -v /var/run/docker.sock:/var/run/docker.sock  -v "$(pwd)/data:/app/data" --name monitor docker.io/geekeryy/docker-monitor:latest
+```
+
+### 2. 运行测试容器
+
+```bash
+docker run -it --rm --name monitor_test alpine:latest
+```
+
+在测试容器内执行以下命令：
+
+```bash
+echo "id=1 WARN test1"
+echo "id=1 WARN test2"
+echo "id=2 ERROR test1"
+echo "id=2 ERROR test2"
+
 ```
 
 ## 开始使用
