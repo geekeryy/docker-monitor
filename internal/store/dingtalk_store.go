@@ -23,6 +23,7 @@ type DingTalkStore struct {
 	atAll         bool
 	atMobiles     []string
 	mentionLevels map[string]struct{}
+	maxEvents     int
 	client        *http.Client
 }
 
@@ -52,9 +53,12 @@ type dingTalkResponse struct {
 	ErrMsg  string `json:"errmsg"`
 }
 
-func NewDingTalkStore(webhookURL, secret string, atAll bool, atMobiles []string, mentionLevels []string) *DingTalkStore {
+func NewDingTalkStore(webhookURL, secret string, atAll bool, atMobiles []string, mentionLevels []string, maxEvents int) *DingTalkStore {
 	if strings.TrimSpace(webhookURL) == "" {
 		return nil
+	}
+	if maxEvents <= 0 {
+		maxEvents = 5
 	}
 	return &DingTalkStore{
 		webhookURL:    strings.TrimSpace(webhookURL),
@@ -62,6 +66,7 @@ func NewDingTalkStore(webhookURL, secret string, atAll bool, atMobiles []string,
 		atAll:         atAll,
 		atMobiles:     atMobiles,
 		mentionLevels: normalizeLevels(mentionLevels),
+		maxEvents:     maxEvents,
 		client: &http.Client{
 			Timeout: 8 * time.Second,
 		},
@@ -79,7 +84,7 @@ func (s *DingTalkStore) AppendBatch(ctx context.Context, batch model.LogBatch) e
 		MsgType: "markdown",
 		Markdown: dingTalkMarkdownBody{
 			Title: buildDingTalkTitle(batch),
-			Text:  buildDingTalkMarkdown(batch),
+			Text:  buildDingTalkMarkdown(batch, s.maxEvents),
 		},
 	}
 
@@ -167,7 +172,7 @@ func signedWebhookURL(rawURL, secret string) (string, error) {
 	return fmt.Sprintf("%s%stimestamp=%s&sign=%s", rawURL, separator, timestamp, signature), nil
 }
 
-func buildDingTalkMarkdown(batch model.LogBatch) string {
+func buildDingTalkMarkdown(batch model.LogBatch, maxEvents int) string {
 	var builder strings.Builder
 	builder.WriteString("### ")
 	builder.WriteString(buildDingTalkTitle(batch))
@@ -182,7 +187,9 @@ func buildDingTalkMarkdown(batch model.LogBatch) string {
 	builder.WriteString(fmt.Sprintf("- 最后时间: `%s`\n", batch.LastSeen.Format(time.RFC3339)))
 	builder.WriteString("\n#### 最近日志\n")
 
-	const maxEvents = 5
+	if maxEvents <= 0 {
+		maxEvents = 5
+	}
 	for i, event := range batch.Events {
 		if i >= maxEvents {
 			builder.WriteString(fmt.Sprintf("\n- 其余 `%d` 条日志已省略", len(batch.Events)-maxEvents))
@@ -212,7 +219,7 @@ func detailedLog(event model.LogEvent) string {
 
 	text = strings.ReplaceAll(text, "```", "'''")
 
-	const maxDetailLength = 2000
+	const maxDetailLength = 5000
 	if len(text) > maxDetailLength {
 		return text[:maxDetailLength] + "\n... (已截断)"
 	}

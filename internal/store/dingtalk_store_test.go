@@ -30,7 +30,7 @@ func TestDingTalkStoreAppendBatchWarnDoesNotMention(t *testing.T) {
 	}))
 	defer server.Close()
 
-	store := NewDingTalkStore(server.URL+"?access_token=test-token", "test-secret", false, []string{"13800000000"}, []string{"ERROR"})
+	store := NewDingTalkStore(server.URL+"?access_token=test-token", "test-secret", false, []string{"13800000000"}, []string{"ERROR"}, 5)
 	err := store.AppendBatch(context.Background(), model.LogBatch{
 		LogID:      "abc123",
 		FirstSeen:  time.Date(2026, 3, 24, 10, 0, 0, 0, time.UTC),
@@ -107,7 +107,7 @@ func TestDingTalkStoreAppendBatchErrorMentionsConfiguredUsers(t *testing.T) {
 	}))
 	defer server.Close()
 
-	store := NewDingTalkStore(server.URL+"?access_token=test-token", "test-secret", false, []string{"13800000000", "13900000000"}, []string{"ERROR"})
+	store := NewDingTalkStore(server.URL+"?access_token=test-token", "test-secret", false, []string{"13800000000", "13900000000"}, []string{"ERROR"}, 5)
 	err := store.AppendBatch(context.Background(), model.LogBatch{
 		LogID:      "err-1",
 		FirstSeen:  time.Date(2026, 3, 24, 10, 0, 0, 0, time.UTC),
@@ -186,7 +186,7 @@ func TestDingTalkStoreAppendBatchMentionsConfiguredLevel(t *testing.T) {
 	}))
 	defer server.Close()
 
-	store := NewDingTalkStore(server.URL+"?access_token=test-token", "test-secret", false, []string{"13800000000"}, []string{"WARN"})
+	store := NewDingTalkStore(server.URL+"?access_token=test-token", "test-secret", false, []string{"13800000000"}, []string{"WARN"}, 5)
 	err := store.AppendBatch(context.Background(), model.LogBatch{
 		LogID:      "warn-1",
 		FirstSeen:  time.Date(2026, 3, 24, 10, 0, 0, 0, time.UTC),
@@ -226,5 +226,50 @@ func TestDingTalkStoreAppendBatchMentionsConfiguredLevel(t *testing.T) {
 	}
 	if got := receivedPayloads[0].Markdown.Title; got != "Docker日志告警 warn-1 [coach_test]" {
 		t.Fatalf("markdown title = %q, want docker host in title", got)
+	}
+}
+
+func TestBuildDingTalkMarkdownRespectsMaxEvents(t *testing.T) {
+	t.Parallel()
+
+	text := buildDingTalkMarkdown(model.LogBatch{
+		LogID:      "limit-1",
+		FirstSeen:  time.Date(2026, 3, 24, 10, 0, 0, 0, time.UTC),
+		LastSeen:   time.Date(2026, 3, 24, 10, 2, 0, 0, time.UTC),
+		Count:      3,
+		Containers: []string{"local-dev-api"},
+		Events: []model.LogEvent{
+			{
+				Timestamp: time.Date(2026, 3, 24, 10, 0, 0, 0, time.UTC),
+				Container: model.ContainerInfo{Name: "local-dev-api"},
+				Level:     "ERROR",
+				Raw:       "first event",
+			},
+			{
+				Timestamp: time.Date(2026, 3, 24, 10, 1, 0, 0, time.UTC),
+				Container: model.ContainerInfo{Name: "local-dev-api"},
+				Level:     "ERROR",
+				Raw:       "second event",
+			},
+			{
+				Timestamp: time.Date(2026, 3, 24, 10, 2, 0, 0, time.UTC),
+				Container: model.ContainerInfo{Name: "local-dev-api"},
+				Level:     "ERROR",
+				Raw:       "third event",
+			},
+		},
+	}, 2)
+
+	if !strings.Contains(text, "first event") {
+		t.Fatalf("markdown text = %q, want first event", text)
+	}
+	if !strings.Contains(text, "second event") {
+		t.Fatalf("markdown text = %q, want second event", text)
+	}
+	if strings.Contains(text, "third event") {
+		t.Fatalf("markdown text = %q, want third event omitted", text)
+	}
+	if !strings.Contains(text, "其余 `1` 条日志已省略") {
+		t.Fatalf("markdown text = %q, want omission summary", text)
 	}
 }

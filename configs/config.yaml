@@ -7,9 +7,9 @@ docker:
 
 filters:
   warn_match:
-    keywords:
-      - "WARN"
-      - "ERROR"
+    regexps:
+      - '(?i)\b(WARN|ERROR)\b'
+    exclude_regexps: []
     json_fields:
       - "level"
     message_fields:
@@ -36,6 +36,7 @@ aggregation:
 dingtalk:
   webhook_url: ""
   secret: ""
+  max_events: 5
   mention_levels:
     - "ERROR"
   at_mobiles:

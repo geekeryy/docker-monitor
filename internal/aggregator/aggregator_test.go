@@ -127,6 +127,48 @@ func TestAggregatorFlushesAllLogsOnceAlertAppears(t *testing.T) {
 	}
 }
 
+func TestAggregatorSortsEventsByTimestampInBatch(t *testing.T) {
+	t.Parallel()
+
+	store := &memoryStore{}
+	agg := New(store, 2, time.Minute, "unknown")
+
+	later := model.LogEvent{
+		Timestamp:    time.Unix(101, 0).UTC(),
+		LogID:        "same-id",
+		AlertMatched: true,
+		Container:    model.ContainerInfo{Name: "app-1"},
+		Message:      "later event",
+	}
+	earlier := model.LogEvent{
+		Timestamp:    time.Unix(100, 0).UTC(),
+		LogID:        "same-id",
+		AlertMatched: true,
+		Container:    model.ContainerInfo{Name: "app-1"},
+		Message:      "earlier event",
+	}
+
+	if err := agg.Add(context.Background(), later); err != nil {
+		t.Fatalf("Add(later) error = %v", err)
+	}
+	if err := agg.Add(context.Background(), earlier); err != nil {
+		t.Fatalf("Add(earlier) error = %v", err)
+	}
+
+	if got := len(store.batches); got != 1 {
+		t.Fatalf("len(store.batches) = %d, want 1", got)
+	}
+	if got := len(store.batches[0].Events); got != 2 {
+		t.Fatalf("len(batch.Events) = %d, want 2", got)
+	}
+	if got := store.batches[0].Events[0].Message; got != "earlier event" {
+		t.Fatalf("first event message = %q, want earlier event", got)
+	}
+	if got := store.batches[0].Events[1].Message; got != "later event" {
+		t.Fatalf("second event message = %q, want later event", got)
+	}
+}
+
 func TestAggregatorDropsGroupsWithoutAlertOnFlush(t *testing.T) {
 	t.Parallel()
 

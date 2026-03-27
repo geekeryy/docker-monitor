@@ -1,6 +1,7 @@
-# syntax=docker/dockerfile:1.7
+ARG GO_IMAGE=docker.m.daocloud.io/library/golang:1.25.5-alpine
+ARG ALPINE_IMAGE=docker.m.daocloud.io/library/alpine:3.22
 
-FROM --platform=$BUILDPLATFORM golang:1.25.5-alpine AS builder
+FROM --platform=$BUILDPLATFORM ${GO_IMAGE} AS builder
 
 WORKDIR /src
 
@@ -18,7 +19,7 @@ RUN GOOS=${TARGETOS:-linux} \
     GOARCH=${TARGETARCH:-amd64} \
     go build -trimpath -ldflags="-s -w" -o /out/monitor ./cmd/monitor
 
-FROM alpine:3.22
+FROM ${ALPINE_IMAGE}
 
 WORKDIR /app
 

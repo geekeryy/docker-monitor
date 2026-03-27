@@ -1,11 +1,11 @@
 services:
   monitor:
     image: docker.io/geekeryy/docker-monitor:latest
-    ports:
-      - 8080:8080
+    restart: unless-stopped
     volumes:
       - .dev.config.yaml:/app/configs/config.yaml
       - ./data:/app/data
       - ~/.ssh:/root/.ssh
       - /var/run/docker.sock:/var/run/docker.sock
+      - /etc/localtime:/etc/localtime:ro
     command: ["-f", "/app/configs/config.yaml"]

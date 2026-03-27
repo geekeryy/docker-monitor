@@ -29,7 +29,13 @@ type Watcher struct {
 	logger          *slog.Logger
 
 	mu     sync.Mutex
-	active map[string]context.CancelFunc
+	active map[string]activeStream
+	ids    map[string]string
+}
+
+type activeStream struct {
+	id     string
+	cancel context.CancelFunc
 }
 
 func NewWatcher(client DiscoveryClient, reader *LogReader, includePatterns []string, ignoredID string, startedAt time.Time, initialSince time.Duration, handler LineHandler, logger *slog.Logger) *Watcher {
@@ -49,7 +55,8 @@ func NewWatcher(client DiscoveryClient, reader *LogReader, includePatterns []str
 		reconnectDelay:  3 * time.Second,
 		handler:         handler,
 		logger:          logger,
-		active:          make(map[string]context.CancelFunc),
+		active:          make(map[string]activeStream),
+		ids:             make(map[string]string),
 	}
 }
 
@@ -125,20 +132,19 @@ func (w *Watcher) maybeStart(ctx context.Context, summary ContainerSummary) {
 		return
 	}
 
-	w.mu.Lock()
-	if _, exists := w.active[info.ID]; exists {
-		w.mu.Unlock()
+	streamCtx, shouldStart, cancelPrevious := w.activate(ctx, info)
+	if cancelPrevious != nil {
+		cancelPrevious()
+	}
+	if !shouldStart {
 		return
 	}
-	streamCtx, cancel := context.WithCancel(ctx)
-	w.active[info.ID] = cancel
-	w.mu.Unlock()
 
-	go w.runStream(streamCtx, info)
+	go w.runStream(ctx, streamCtx, info)
 }
 
-func (w *Watcher) runStream(ctx context.Context, info model.ContainerInfo) {
-	defer w.stop(info.ID)
+func (w *Watcher) runStream(rootCtx, ctx context.Context, info model.ContainerInfo) {
+	defer w.removeActive(info.Name, info.ID)
 
 	lastSeen := w.startedAt
 	if w.initialSince > 0 {
@@ -149,14 +155,33 @@ func (w *Watcher) runStream(ctx context.Context, info model.ContainerInfo) {
 			lastSeen = raw.Timestamp
 			return w.handler(streamCtx, raw)
 		})
-		if err == nil || errors.Is(err, context.Canceled) {
+		if errors.Is(err, context.Canceled) {
 			return
 		}
 
-		w.logger.Warn("docker log stream disconnected, retrying",
-			slog.String("container", info.Name),
-			slog.String("error", err.Error()),
-		)
+		if replacement, ok := w.resolveContainerByName(rootCtx, info.Name); ok && replacement.ID != info.ID {
+			w.logger.Info("docker container replaced, switching log stream",
+				slog.String("container", info.Name),
+				slog.String("old_container_id", info.ID),
+				slog.String("new_container_id", replacement.ID),
+			)
+			w.maybeStart(rootCtx, ContainerSummary{
+				ID:    replacement.ID,
+				Names: []string{replacement.Name},
+			})
+			return
+		}
+
+		if err != nil {
+			w.logger.Warn("docker log stream disconnected, retrying",
+				slog.String("container", info.Name),
+				slog.String("error", err.Error()),
+			)
+		} else {
+			w.logger.Warn("docker log stream ended unexpectedly, retrying",
+				slog.String("container", info.Name),
+			)
+		}
 
 		select {
 		case <-ctx.Done():
@@ -168,21 +193,35 @@ func (w *Watcher) runStream(ctx context.Context, info model.ContainerInfo) {
 
 func (w *Watcher) stop(id string) {
 	w.mu.Lock()
-	defer w.mu.Unlock()
-	cancel, ok := w.active[id]
+	name, ok := w.ids[id]
 	if !ok {
+		w.mu.Unlock()
 		return
 	}
-	delete(w.active, id)
-	cancel()
+	stream, ok := w.active[name]
+	if !ok || stream.id != id {
+		delete(w.ids, id)
+		w.mu.Unlock()
+		return
+	}
+	delete(w.active, name)
+	delete(w.ids, id)
+	w.mu.Unlock()
+	stream.cancel()
 }
 
 func (w *Watcher) stopAll() {
 	w.mu.Lock()
-	defer w.mu.Unlock()
-	for id, cancel := range w.active {
+	streams := make([]context.CancelFunc, 0, len(w.active))
+	for name, stream := range w.active {
+		streams = append(streams, stream.cancel)
+		delete(w.ids, stream.id)
+		delete(w.active, name)
+	}
+	w.mu.Unlock()
+
+	for _, cancel := range streams {
 		cancel()
-		delete(w.active, id)
 	}
 }
 
@@ -208,6 +247,61 @@ func eventContainerID(msg EventMessage) string {
 
 func (w *Watcher) shouldIgnore(containerID string) bool {
 	return strings.TrimSpace(containerID) != "" && strings.TrimSpace(containerID) == w.ignoredID
+}
+
+func (w *Watcher) activate(ctx context.Context, info model.ContainerInfo) (context.Context, bool, context.CancelFunc) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if current, exists := w.active[info.Name]; exists {
+		if current.id == info.ID {
+			return nil, false, nil
+		}
+		delete(w.ids, current.id)
+		streamCtx, cancel := context.WithCancel(ctx)
+		w.active[info.Name] = activeStream{id: info.ID, cancel: cancel}
+		w.ids[info.ID] = info.Name
+		return streamCtx, true, current.cancel
+	}
+
+	streamCtx, cancel := context.WithCancel(ctx)
+	w.active[info.Name] = activeStream{id: info.ID, cancel: cancel}
+	w.ids[info.ID] = info.Name
+	return streamCtx, true, nil
+}
+
+func (w *Watcher) removeActive(name, id string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	stream, ok := w.active[name]
+	if !ok || stream.id != id {
+		return
+	}
+	delete(w.active, name)
+	delete(w.ids, id)
+}
+
+func (w *Watcher) resolveContainerByName(ctx context.Context, name string) (model.ContainerInfo, bool) {
+	containers, err := w.client.ContainerList(ctx, ContainerListOptions{})
+	if err != nil {
+		w.logger.Warn("refresh container list failed",
+			slog.String("container", name),
+			slog.String("error", err.Error()),
+		)
+		return model.ContainerInfo{}, false
+	}
+
+	for _, summary := range containers {
+		for _, candidate := range summary.Names {
+			trimmed := strings.TrimPrefix(candidate, "/")
+			if trimmed == name {
+				return model.ContainerInfo{ID: summary.ID, Name: trimmed}, true
+			}
+		}
+	}
+
+	return model.ContainerInfo{}, false
 }
 
 func selectContainer(summary ContainerSummary, patterns []string) (model.ContainerInfo, bool) {

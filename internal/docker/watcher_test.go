@@ -5,6 +5,7 @@ import (
 	"io"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -157,6 +158,92 @@ func TestWatcherHandleEventIgnoresSelfContainer(t *testing.T) {
 	}
 }
 
+func TestWatcherReattachesWhenContainerRecreatedWithSameName(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	discoveryClient := &staticDiscoveryClient{
+		containers: []ContainerSummary{
+			{
+				ID:    "new-container-id",
+				Names: []string{"/api"},
+			},
+		},
+	}
+	logsClient := &sequenceLogsClient{
+		readers: map[string]func(context.Context) io.ReadCloser{
+			"old-container-id": func(context.Context) io.ReadCloser {
+				return io.NopCloser(strings.NewReader(""))
+			},
+			"new-container-id": func(ctx context.Context) io.ReadCloser {
+				return &contextBoundReadCloser{ctx: ctx}
+			},
+		},
+		calls: make(chan string, 4),
+	}
+	watcher := NewWatcher(
+		discoveryClient,
+		NewLogReader(logsClient),
+		[]string{"api"},
+		"",
+		time.Now(),
+		0,
+		func(context.Context, model.RawLog) error { return nil },
+		slog.Default(),
+	)
+
+	watcher.maybeStart(ctx, ContainerSummary{
+		ID:    "old-container-id",
+		Names: []string{"/api"},
+	})
+
+	waitForContainerLogsCall(t, logsClient.calls, "old-container-id")
+	waitForContainerLogsCall(t, logsClient.calls, "new-container-id")
+}
+
+func TestWatcherMaybeStartReplacesExistingStreamForSameName(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	logsClient := &sequenceLogsClient{
+		readers: map[string]func(context.Context) io.ReadCloser{
+			"container-a": func(ctx context.Context) io.ReadCloser {
+				return &contextBoundReadCloser{ctx: ctx}
+			},
+			"container-b": func(ctx context.Context) io.ReadCloser {
+				return &contextBoundReadCloser{ctx: ctx}
+			},
+		},
+		calls: make(chan string, 4),
+	}
+	watcher := NewWatcher(
+		&staticDiscoveryClient{},
+		NewLogReader(logsClient),
+		[]string{"api"},
+		"",
+		time.Now(),
+		0,
+		func(context.Context, model.RawLog) error { return nil },
+		slog.Default(),
+	)
+
+	watcher.maybeStart(ctx, ContainerSummary{
+		ID:    "container-a",
+		Names: []string{"/api"},
+	})
+	waitForContainerLogsCall(t, logsClient.calls, "container-a")
+
+	watcher.maybeStart(ctx, ContainerSummary{
+		ID:    "container-b",
+		Names: []string{"/api"},
+	})
+	waitForContainerLogsCall(t, logsClient.calls, "container-b")
+}
+
 type recordingLogsClient struct {
 	calls chan string
 }
@@ -164,4 +251,64 @@ type recordingLogsClient struct {
 func (c *recordingLogsClient) ContainerLogs(_ context.Context, containerID string, _ ContainerLogsOptions) (io.ReadCloser, error) {
 	c.calls <- containerID
 	return io.NopCloser(strings.NewReader("")), nil
+}
+
+type staticDiscoveryClient struct {
+	containers []ContainerSummary
+}
+
+func (c *staticDiscoveryClient) ContainerList(_ context.Context, _ ContainerListOptions) ([]ContainerSummary, error) {
+	return c.containers, nil
+}
+
+func (c *staticDiscoveryClient) Events(_ context.Context, _ EventsOptions) (<-chan EventMessage, <-chan error) {
+	msgCh := make(chan EventMessage)
+	errCh := make(chan error)
+	close(msgCh)
+	close(errCh)
+	return msgCh, errCh
+}
+
+type sequenceLogsClient struct {
+	mu      sync.Mutex
+	readers map[string]func(context.Context) io.ReadCloser
+	calls   chan string
+}
+
+func (c *sequenceLogsClient) ContainerLogs(ctx context.Context, containerID string, _ ContainerLogsOptions) (io.ReadCloser, error) {
+	c.mu.Lock()
+	readerFactory := c.readers[containerID]
+	c.mu.Unlock()
+
+	c.calls <- containerID
+	if readerFactory == nil {
+		return io.NopCloser(strings.NewReader("")), nil
+	}
+	return readerFactory(ctx), nil
+}
+
+type contextBoundReadCloser struct {
+	ctx context.Context
+}
+
+func (r *contextBoundReadCloser) Read(_ []byte) (int, error) {
+	<-r.ctx.Done()
+	return 0, io.EOF
+}
+
+func (r *contextBoundReadCloser) Close() error {
+	return nil
+}
+
+func waitForContainerLogsCall(t *testing.T, calls <-chan string, want string) {
+	t.Helper()
+
+	select {
+	case got := <-calls:
+		if got != want {
+			t.Fatalf("ContainerLogs called for %q, want %q", got, want)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for ContainerLogs(%q)", want)
+	}
 }

@@ -39,33 +39,15 @@ func run() error {
 		return err
 	}
 
-	sinceDuration, err := cfg.SinceDuration()
+	hostConfigs, err := cfg.ResolveHosts()
 	if err != nil {
 		return err
 	}
-	flushInterval, err := cfg.FlushIntervalDuration()
-	if err != nil {
-		return err
-	}
-
-	fileStore := store.NewFileStore(cfg.Storage.OutputDir)
-	dingTalkStore := store.NewDingTalkStore(
-		cfg.DingTalk.WebhookURL,
-		cfg.DingTalk.Secret,
-		cfg.DingTalk.AtAll,
-		cfg.DingTalk.AtMobiles,
-		cfg.DingTalk.MentionLevels,
-	)
-	outputStore := store.NewMultiStore(
-		fileStore,
-		store.NewBestEffortStore("dingtalk", dingTalkStore, logger),
-	)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	hosts := cfg.Docker.HostsOrDefault()
-	instances, err := newMonitorInstances(ctx, cfg, hosts, monitorStartedAt, sinceDuration, flushInterval, outputStore, logger)
+	instances, err := newMonitorInstances(ctx, hostConfigs, monitorStartedAt, logger)
 	if err != nil {
 		return err
 	}
@@ -76,10 +58,7 @@ func run() error {
 	}()
 
 	logger.Info("starting docker warn monitor",
-		slog.Any("docker_hosts", hosts),
-		slog.Any("patterns", cfg.Docker.IncludePatterns),
-		slog.String("output_dir", cfg.Storage.OutputDir),
-		slog.Bool("dingtalk_enabled", dingTalkStore != nil),
+		slog.Any("docker_hosts", resolvedDockerHosts(hostConfigs)),
 	)
 
 	errCh := make(chan error, len(instances)*2)
@@ -133,18 +112,44 @@ type monitorInstance struct {
 	watcher    *dockermonitor.Watcher
 }
 
-func newMonitorInstances(ctx context.Context, cfg config.Config, hosts []string, monitorStartedAt time.Time, sinceDuration, flushInterval time.Duration, outputStore *store.MultiStore, logger *slog.Logger) ([]monitorInstance, error) {
-	instances := make([]monitorInstance, 0, len(hosts))
-	multiHost := len(hosts) > 1
+func newMonitorInstances(ctx context.Context, hostConfigs []config.ResolvedHostConfig, monitorStartedAt time.Time, logger *slog.Logger) ([]monitorInstance, error) {
+	instances := make([]monitorInstance, 0, len(hostConfigs))
+	multiHost := len(hostConfigs) > 1
 
-	for _, host := range hosts {
-		client, err := newDockerClient(host)
+	for _, hostConfig := range hostConfigs {
+		cfg := hostConfig.Config
+		sinceDuration, err := cfg.SinceDuration()
+		if err != nil {
+			return nil, err
+		}
+		flushInterval, err := cfg.FlushIntervalDuration()
 		if err != nil {
 			return nil, err
 		}
 
-		label := dockerHostLabel(host)
+		client, err := newDockerClient(hostConfig.Host)
+		if err != nil {
+			return nil, err
+		}
+
+		label := dockerHostLabel(hostConfig.Host)
 		instanceLogger := logger.With(slog.String("docker_host", label))
+		outputStore := store.NewMultiStore(
+			store.NewFileStore(cfg.Storage.OutputDir),
+			store.NewBestEffortStore("dingtalk", store.NewDingTalkStore(
+				cfg.DingTalk.WebhookURL,
+				cfg.DingTalk.Secret,
+				cfg.DingTalk.AtAll,
+				cfg.DingTalk.AtMobiles,
+				cfg.DingTalk.MentionLevels,
+				cfg.DingTalk.MaxEvents,
+			), instanceLogger),
+		)
+		instanceLogger.Info("configured docker host",
+			slog.Any("patterns", cfg.Docker.IncludePatterns),
+			slog.String("output_dir", cfg.Storage.OutputDir),
+			slog.Bool("dingtalk_enabled", strings.TrimSpace(cfg.DingTalk.WebhookURL) != ""),
+		)
 		selfContainerID, err := dockermonitor.DetectSelfContainerID(ctx, client)
 		if err != nil {
 			_ = client.Close()
@@ -190,6 +195,17 @@ func newMonitorInstances(ctx context.Context, cfg config.Config, hosts []string,
 	}
 
 	return instances, nil
+}
+
+func resolvedDockerHosts(hostConfigs []config.ResolvedHostConfig) []string {
+	hosts := make([]string, 0, len(hostConfigs))
+	for _, hostConfig := range hostConfigs {
+		hosts = append(hosts, hostConfig.Host)
+	}
+	if len(hosts) == 0 {
+		return []string{""}
+	}
+	return hosts
 }
 
 func dockerHostLabel(host string) string {

@@ -15,7 +15,7 @@
 - 支持本地和多主机 Docker 监控。
 - 支持 `unix`、`tcp`、`http`、`https`、`ssh` 等 Docker Host 连接方式。
 - 支持文本日志和 JSON 日志。
-- 可根据关键字识别告警级别，例如 `WARN`、`ERROR`。
+- 可根据正则识别告警级别，并支持排除正则。
 - 可从 JSON 字段或正则中提取 `log_id` / `trace_id` / `alert_id`。
 - 按 `log_id` 聚合多条相关日志，减少重复告警。
 - 聚合结果默认落盘为 `jsonl` 文件。
@@ -30,7 +30,7 @@
 1. 只处理容器名匹配 `docker.include_patterns` 的容器。
 2. 对每一行日志进行解析。
 3. 如果是 JSON 日志，会优先从 JSON 字段里提取时间、消息、级别、`log_id`。
-4. 如果不是 JSON，或 JSON 中没有识别出告警级别/`log_id`，会继续用纯文本关键字和正则补充识别。
+4. 如果不是 JSON，或 JSON 中没有识别出告警级别/`log_id`，会继续用纯文本正则补充识别。
 5. 识别出的事件按 `log_id` 聚合。
 6. 聚合结果写入本地文件，并可同步推送钉钉。
 
@@ -147,9 +147,10 @@ docker:
 
 filters:
   warn_match:
-    keywords:
-      - "WARN"
-      - "ERROR"
+    regexps:
+      - '(?i)\b(WARN|ERROR)\b'
+    exclude_regexps:
+      - '(?i)context canceled'
     json_fields:
       - "level"
       - "severity"
@@ -180,6 +181,7 @@ aggregation:
 dingtalk:
   webhook_url: ""
   secret: ""
+  max_events: 5
   mention_levels:
     - "ERROR"
   at_mobiles:
@@ -211,10 +213,27 @@ storage:
 
 用于识别“这条日志是不是告警”。
 
-- `keywords`: 文本或级别关键字，默认包含 `WARN`、`ERROR`
+- `regexps`: 告警匹配正则；如果带捕获组，优先使用第一个非空捕获组作为级别
+- `exclude_regexps`: 排除匹配正则；命中后整条日志会被跳过
 - `json_fields`: JSON 中用于表示级别的字段名
 - `message_fields`: JSON 中优先作为消息体展示的字段名
 - `time_fields`: JSON 中优先作为时间戳读取的字段名
+
+默认告警规则示例：
+
+- `(?i)\b(WARN|ERROR)\b`
+
+例如你可以用下面的配置排除已知噪音：
+
+```yaml
+filters:
+  warn_match:
+    regexps:
+      - '(?i)\b(WARN|ERROR)\b'
+    exclude_regexps:
+      - '(?i)context canceled'
+      - 'timeout=\d+ms'
+```
 
 如果日志是这样的：
 
@@ -265,6 +284,7 @@ storage:
 
 - `webhook_url`: 钉钉机器人 Webhook，留空表示禁用
 - `secret`: 钉钉加签密钥，可选
+- `max_events`: 单次 Markdown 消息中最多展示多少条最近日志
 - `mention_levels`: 哪些级别触发 `@` 提醒
 - `at_mobiles`: 要提醒的手机号列表
 - `at_all`: 是否 `@所有人`
@@ -373,6 +393,7 @@ docker:
 dingtalk:
   webhook_url: "https://oapi.dingtalk.com/robot/send?access_token=xxx"
   secret: "SECxxx"
+  max_events: 5
   mention_levels:
     - "ERROR"
   at_mobiles:

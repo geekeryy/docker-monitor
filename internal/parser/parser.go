@@ -13,16 +13,26 @@ import (
 )
 
 type Parser struct {
-	warnFields    []string
-	messageFields []string
-	timeFields    []string
-	warnKeywords  []string
-	logIDKeys     []string
-	logIDRegexps  []*regexp.Regexp
-	unknownLogID  string
+	warnFields     []string
+	messageFields  []string
+	timeFields     []string
+	warnRegexps    []*regexp.Regexp
+	excludeRegexps []*regexp.Regexp
+	logIDKeys      []string
+	logIDRegexps   []*regexp.Regexp
+	unknownLogID   string
 }
 
 func New(cfg config.FilterConfig, unknownLogID string) (*Parser, error) {
+	warnRegexps := make([]*regexp.Regexp, 0, len(cfg.WarnMatch.Regexps))
+	for _, expr := range cfg.WarnMatch.Regexps {
+		re, err := regexp.Compile(expr)
+		if err != nil {
+			return nil, fmt.Errorf("compile warn regexp %q: %w", expr, err)
+		}
+		warnRegexps = append(warnRegexps, re)
+	}
+
 	regexps := make([]*regexp.Regexp, 0, len(cfg.LogIDExtract.Regexps))
 	for _, expr := range cfg.LogIDExtract.Regexps {
 		re, err := regexp.Compile(expr)
@@ -32,18 +42,28 @@ func New(cfg config.FilterConfig, unknownLogID string) (*Parser, error) {
 		regexps = append(regexps, re)
 	}
 
-	p := &Parser{
-		warnFields:    normalizeKeys(cfg.WarnMatch.JSONFields),
-		messageFields: normalizeKeys(cfg.WarnMatch.MessageFields),
-		timeFields:    normalizeKeys(cfg.WarnMatch.TimeFields),
-		warnKeywords:  normalizeKeywords(cfg.WarnMatch.Keywords),
-		logIDKeys:     normalizeKeys(cfg.LogIDExtract.JSONKeys),
-		logIDRegexps:  regexps,
-		unknownLogID:  unknownLogID,
+	excludeRegexps := make([]*regexp.Regexp, 0, len(cfg.WarnMatch.ExcludeRegexps))
+	for _, expr := range cfg.WarnMatch.ExcludeRegexps {
+		re, err := regexp.Compile(expr)
+		if err != nil {
+			return nil, fmt.Errorf("compile warn exclude regexp %q: %w", expr, err)
+		}
+		excludeRegexps = append(excludeRegexps, re)
 	}
 
-	if len(p.warnKeywords) == 0 {
-		p.warnKeywords = []string{"WARN"}
+	p := &Parser{
+		warnFields:     normalizeKeys(cfg.WarnMatch.JSONFields),
+		messageFields:  normalizeKeys(cfg.WarnMatch.MessageFields),
+		timeFields:     normalizeKeys(cfg.WarnMatch.TimeFields),
+		warnRegexps:    warnRegexps,
+		excludeRegexps: excludeRegexps,
+		logIDKeys:      normalizeKeys(cfg.LogIDExtract.JSONKeys),
+		logIDRegexps:   regexps,
+		unknownLogID:   unknownLogID,
+	}
+
+	if len(p.warnRegexps) == 0 {
+		p.warnRegexps = []*regexp.Regexp{regexp.MustCompile(`(?i)\bWARN\b`)}
 	}
 	if len(p.messageFields) == 0 {
 		p.messageFields = []string{"message", "msg", "log"}
@@ -80,7 +100,7 @@ func (p *Parser) Parse(raw model.RawLog) (*model.LogEvent, bool, error) {
 		if ts, ok := parseTimestamp(parsedJSON, p.timeFields); ok {
 			event.Timestamp = ts
 		}
-		if level, ok := extractWarnLevel(parsedJSON, p.warnFields, p.warnKeywords); ok {
+		if level, ok := extractWarnLevel(parsedJSON, p.warnFields, p.warnRegexps); ok {
 			event.Level = level
 			event.AlertMatched = true
 		}
@@ -90,11 +110,16 @@ func (p *Parser) Parse(raw model.RawLog) (*model.LogEvent, bool, error) {
 	}
 
 	if event.Level == "" {
-		level, ok := extractWarnLevelFromText(line, p.warnKeywords)
+		level, ok := extractWarnLevelFromText(line, p.warnRegexps)
 		if ok {
 			event.Level = level
 			event.AlertMatched = true
 		}
+	}
+
+	if hasAnyRegexp(event.Message, p.excludeRegexps) ||
+		hasAnyRegexp(line, p.excludeRegexps) {
+		return nil, false, nil
 	}
 
 	if event.LogID == p.unknownLogID {
@@ -116,16 +141,6 @@ func normalizeKeys(values []string) []string {
 	out := make([]string, 0, len(values))
 	for _, value := range values {
 		if trimmed := strings.TrimSpace(strings.ToLower(value)); trimmed != "" {
-			out = append(out, trimmed)
-		}
-	}
-	return out
-}
-
-func normalizeKeywords(values []string) []string {
-	out := make([]string, 0, len(values))
-	for _, value := range values {
-		if trimmed := strings.TrimSpace(strings.ToUpper(value)); trimmed != "" {
 			out = append(out, trimmed)
 		}
 	}
@@ -194,31 +209,50 @@ func parseTimestampString(value string) (time.Time, bool) {
 	return time.Time{}, false
 }
 
-func extractWarnLevel(payload map[string]any, fields []string, keywords []string) (string, bool) {
+func extractWarnLevel(payload map[string]any, fields []string, regexps []*regexp.Regexp) (string, bool) {
 	for _, wanted := range fields {
 		for field, value := range payload {
 			if !strings.EqualFold(field, wanted) {
 				continue
 			}
-			level := strings.ToUpper(strings.TrimSpace(fmt.Sprint(value)))
-			for _, keyword := range keywords {
-				if level == keyword {
-					return level, true
-				}
+			level := strings.TrimSpace(fmt.Sprint(value))
+			if matched, ok := matchWarnRegexp(level, regexps); ok {
+				return matched, true
 			}
 		}
 	}
 	return "", false
 }
 
-func extractWarnLevelFromText(line string, keywords []string) (string, bool) {
-	upper := strings.ToUpper(line)
-	for _, keyword := range keywords {
-		if strings.Contains(upper, keyword) {
-			return keyword, true
+func extractWarnLevelFromText(line string, regexps []*regexp.Regexp) (string, bool) {
+	return matchWarnRegexp(line, regexps)
+}
+
+func matchWarnRegexp(text string, regexps []*regexp.Regexp) (string, bool) {
+	for _, re := range regexps {
+		matches := re.FindStringSubmatch(text)
+		if len(matches) == 0 {
+			continue
+		}
+		for _, match := range matches[1:] {
+			if trimmed := strings.TrimSpace(match); trimmed != "" {
+				return strings.ToUpper(trimmed), true
+			}
+		}
+		if trimmed := strings.TrimSpace(matches[0]); trimmed != "" {
+			return strings.ToUpper(trimmed), true
 		}
 	}
 	return "", false
+}
+
+func hasAnyRegexp(text string, regexps []*regexp.Regexp) bool {
+	for _, re := range regexps {
+		if re.MatchString(text) {
+			return true
+		}
+	}
+	return false
 }
 
 func extractLogIDFromJSON(payload map[string]any, keys []string) (string, bool) {

@@ -3,6 +3,7 @@ package aggregator
 import (
 	"context"
 	"errors"
+	"sort"
 	"sync"
 	"time"
 
@@ -145,6 +146,9 @@ func snapshotBatch(key string, buffer *groupBuffer) model.LogBatch {
 	}
 
 	events := append([]model.LogEvent(nil), buffer.events...)
+	sort.SliceStable(events, func(i, j int) bool {
+		return events[i].Timestamp.Before(events[j].Timestamp)
+	})
 	return model.LogBatch{
 		LogID:      key,
 		FirstSeen:  buffer.firstSeen,

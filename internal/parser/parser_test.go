@@ -13,7 +13,7 @@ func TestParseJSONWarnLog(t *testing.T) {
 
 	p, err := New(config.FilterConfig{
 		WarnMatch: config.WarnMatchConfig{
-			Keywords:      []string{"WARN"},
+			Regexps:       []string{`(?i)\b(WARN)\b`},
 			JSONFields:    []string{"level"},
 			MessageFields: []string{"message"},
 			TimeFields:    []string{"time"},
@@ -59,7 +59,7 @@ func TestParseTextWarnLogWithRegexFallback(t *testing.T) {
 
 	p, err := New(config.FilterConfig{
 		WarnMatch: config.WarnMatchConfig{
-			Keywords: []string{"WARN"},
+			Regexps: []string{`(?i)\b(WARN)\b`},
 		},
 		LogIDExtract: config.LogIDExtractConfig{
 			Regexps: []string{`(?i)\blog[_-]?id=([A-Za-z0-9._:-]+)`},
@@ -97,7 +97,7 @@ func TestParseNonWarnLogWithID(t *testing.T) {
 
 	p, err := New(config.FilterConfig{
 		WarnMatch: config.WarnMatchConfig{
-			Keywords:      []string{"WARN"},
+			Regexps:       []string{`(?i)\b(WARN)\b`},
 			JSONFields:    []string{"level"},
 			MessageFields: []string{"message"},
 			TimeFields:    []string{"time"},
@@ -135,7 +135,7 @@ func TestParseSkipsNonWarnLogs(t *testing.T) {
 
 	p, err := New(config.FilterConfig{
 		WarnMatch: config.WarnMatchConfig{
-			Keywords: []string{"WARN"},
+			Regexps: []string{`(?i)\b(WARN)\b`},
 		},
 	}, "unknown")
 	if err != nil {
@@ -151,5 +151,155 @@ func TestParseSkipsNonWarnLogs(t *testing.T) {
 	}
 	if ok {
 		t.Fatalf("Parse() ok = true, want false")
+	}
+}
+
+func TestParseSkipsTextLogMatchedByExcludeKeyword(t *testing.T) {
+	t.Parallel()
+
+	p, err := New(config.FilterConfig{
+		WarnMatch: config.WarnMatchConfig{
+			Regexps:        []string{`(?i)\b(WARN)\b`},
+			ExcludeRegexps: []string{`(?i)IGNORE_ME`},
+		},
+		LogIDExtract: config.LogIDExtractConfig{
+			Regexps: []string{`(?i)\blog[_-]?id=([A-Za-z0-9._:-]+)`},
+		},
+	}, "unknown")
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	_, ok, err := p.Parse(model.RawLog{
+		Timestamp: time.Unix(50, 0).UTC(),
+		Container: model.ContainerInfo{Name: "worker-1"},
+		Stream:    "stderr",
+		Line:      "2026-03-24 10:20:30 WARN queue lag detected IGNORE_ME log_id=job-42",
+	})
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	if ok {
+		t.Fatalf("Parse() ok = true, want false")
+	}
+}
+
+func TestParseSkipsJSONLogMatchedByExcludeKeyword(t *testing.T) {
+	t.Parallel()
+
+	p, err := New(config.FilterConfig{
+		WarnMatch: config.WarnMatchConfig{
+			Regexps:        []string{`(?i)\b(ERROR)\b`},
+			ExcludeRegexps: []string{`(?i)IGNORE_ME`},
+			JSONFields:     []string{"level"},
+			MessageFields:  []string{"message"},
+		},
+		LogIDExtract: config.LogIDExtractConfig{
+			JSONKeys: []string{"log_id"},
+		},
+	}, "unknown")
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	_, ok, err := p.Parse(model.RawLog{
+		Timestamp: time.Unix(60, 0).UTC(),
+		Container: model.ContainerInfo{Name: "app-1"},
+		Stream:    "stdout",
+		Line:      `{"level":"ERROR","log_id":"err-1","message":"IGNORE_ME create order failed"}`,
+	})
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	if ok {
+		t.Fatalf("Parse() ok = true, want false")
+	}
+}
+
+func TestParseSkipsTextLogMatchedByExcludeRegexp(t *testing.T) {
+	t.Parallel()
+
+	p, err := New(config.FilterConfig{
+		WarnMatch: config.WarnMatchConfig{
+			Regexps:        []string{`(?i)\b(WARN)\b`},
+			ExcludeRegexps: []string{`timeout=\d+ms`},
+		},
+		LogIDExtract: config.LogIDExtractConfig{
+			Regexps: []string{`(?i)\blog[_-]?id=([A-Za-z0-9._:-]+)`},
+		},
+	}, "unknown")
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	_, ok, err := p.Parse(model.RawLog{
+		Timestamp: time.Unix(70, 0).UTC(),
+		Container: model.ContainerInfo{Name: "worker-1"},
+		Stream:    "stderr",
+		Line:      "2026-03-24 10:20:30 WARN retry timeout=1234ms log_id=job-42",
+	})
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	if ok {
+		t.Fatalf("Parse() ok = true, want false")
+	}
+}
+
+func TestParseSkipsJSONLogMatchedByExcludeRegexp(t *testing.T) {
+	t.Parallel()
+
+	p, err := New(config.FilterConfig{
+		WarnMatch: config.WarnMatchConfig{
+			Regexps:        []string{`(?i)\b(ERROR)\b`},
+			ExcludeRegexps: []string{`(?i)deadline.*exceeded`},
+			JSONFields:     []string{"level"},
+			MessageFields:  []string{"message"},
+		},
+		LogIDExtract: config.LogIDExtractConfig{
+			JSONKeys: []string{"log_id"},
+		},
+	}, "unknown")
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	_, ok, err := p.Parse(model.RawLog{
+		Timestamp: time.Unix(80, 0).UTC(),
+		Container: model.ContainerInfo{Name: "app-1"},
+		Stream:    "stdout",
+		Line:      `{"level":"ERROR","log_id":"err-1","message":"request deadline was exceeded"}`,
+	})
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	if ok {
+		t.Fatalf("Parse() ok = true, want false")
+	}
+}
+
+func TestNewRejectsInvalidExcludeRegexp(t *testing.T) {
+	t.Parallel()
+
+	_, err := New(config.FilterConfig{
+		WarnMatch: config.WarnMatchConfig{
+			ExcludeRegexps: []string{"("},
+		},
+	}, "unknown")
+	if err == nil {
+		t.Fatal("New() error = nil, want error")
+	}
+}
+
+func TestNewRejectsInvalidWarnRegexp(t *testing.T) {
+	t.Parallel()
+
+	_, err := New(config.FilterConfig{
+		WarnMatch: config.WarnMatchConfig{
+			Regexps: []string{"("},
+		},
+	}, "unknown")
+	if err == nil {
+		t.Fatal("New() error = nil, want error")
 	}
 }
