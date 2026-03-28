@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -269,11 +270,33 @@ func (c Config) validateResolved() error {
 	if c.Aggregation.UnknownLogID == "" {
 		return errors.New("aggregation.unknown_log_id must not be empty")
 	}
-	if c.DingTalk.Secret != "" && c.DingTalk.WebhookURL == "" {
+	if strings.TrimSpace(c.DingTalk.Secret) != "" && strings.TrimSpace(c.DingTalk.WebhookURL) == "" {
 		return errors.New("dingtalk.webhook_url must not be empty when dingtalk.secret is set")
+	}
+	if err := validateWebhookURL(c.DingTalk.WebhookURL); err != nil {
+		return err
 	}
 	if c.DingTalk.MaxEvents <= 0 {
 		return errors.New("dingtalk.max_events must be greater than 0")
+	}
+	return nil
+}
+
+func validateWebhookURL(rawURL string) error {
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return nil
+	}
+
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("parse dingtalk.webhook_url: %w", err)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return errors.New("dingtalk.webhook_url must use http or https")
+	}
+	if strings.TrimSpace(parsed.Host) == "" {
+		return errors.New("dingtalk.webhook_url must include a host")
 	}
 	return nil
 }

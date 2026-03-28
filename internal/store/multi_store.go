@@ -34,3 +34,17 @@ func (s *MultiStore) AppendBatch(ctx context.Context, batch model.LogBatch) erro
 	}
 	return errors.Join(errs...)
 }
+
+func (s *MultiStore) Close() error {
+	var errs []error
+	for _, sink := range s.sinks {
+		closer, ok := sink.(closeableBatchSink)
+		if !ok {
+			continue
+		}
+		if err := closer.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}

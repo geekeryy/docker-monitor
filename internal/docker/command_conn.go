@@ -13,8 +13,7 @@ import (
 )
 
 func newCommandConn(ctx context.Context, cmd string, args ...string) (net.Conn, error) {
-	cmdCtx := context.WithoutCancel(ctx)
-	command := exec.CommandContext(cmdCtx, cmd, args...)
+	command := exec.CommandContext(ctx, cmd, args...)
 
 	stdin, err := command.StdinPipe()
 	if err != nil {

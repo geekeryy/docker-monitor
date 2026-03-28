@@ -40,11 +40,18 @@ func (s *FileStore) AppendBatch(_ context.Context, batch model.LogBatch) error {
 	if err != nil {
 		return fmt.Errorf("open output file: %w", err)
 	}
-	defer file.Close()
 
 	encoder := json.NewEncoder(file)
 	if err := encoder.Encode(batch); err != nil {
+		_ = file.Close()
 		return fmt.Errorf("encode batch: %w", err)
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("sync output file: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("close output file: %w", err)
 	}
 
 	return nil

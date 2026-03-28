@@ -15,3 +15,7 @@ func isNilBatchSink(sink batchSink) bool {
 		return false
 	}
 }
+
+type closeableBatchSink interface {
+	Close() error
+}

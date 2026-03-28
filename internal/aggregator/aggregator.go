@@ -19,6 +19,7 @@ type Aggregator struct {
 	flushSize     int
 	flushInterval time.Duration
 	unknownLogID  string
+	maxGroupSize  int
 
 	mu     sync.Mutex
 	groups map[string]*groupBuffer
@@ -32,12 +33,15 @@ type groupBuffer struct {
 	events     []model.LogEvent
 }
 
+const maxBufferedEventsFactor = 10
+
 func New(store Store, flushSize int, flushInterval time.Duration, unknownLogID string) *Aggregator {
 	return &Aggregator{
 		store:         store,
 		flushSize:     flushSize,
 		flushInterval: flushInterval,
 		unknownLogID:  unknownLogID,
+		maxGroupSize:  maxBufferedEvents(flushSize),
 		groups:        make(map[string]*groupBuffer),
 	}
 }
@@ -49,9 +53,9 @@ func (a *Aggregator) Run(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
-			return a.FlushAll(context.Background())
+			return nil
 		case <-ticker.C:
-			if err := a.FlushAll(ctx); err != nil {
+			if err := a.FlushAll(context.Background()); err != nil {
 				return err
 			}
 		}
@@ -108,6 +112,12 @@ func (a *Aggregator) add(event model.LogEvent) (model.LogBatch, bool) {
 	}
 
 	buffer.events = append(buffer.events, event)
+	if overflow := len(buffer.events) - a.maxGroupSize; overflow > 0 {
+		buffer.events = append([]model.LogEvent(nil), buffer.events[overflow:]...)
+		if len(buffer.events) > 0 {
+			buffer.firstSeen = buffer.events[0].Timestamp
+		}
+	}
 	buffer.containers[event.Container.Name] = struct{}{}
 	buffer.hasAlert = buffer.hasAlert || event.AlertMatched
 
@@ -170,4 +180,14 @@ func batchFromSingleEvent(event model.LogEvent) model.LogBatch {
 		Events:     []model.LogEvent{event},
 		FlushedAt:  time.Now().UTC(),
 	}
+}
+
+func maxBufferedEvents(flushSize int) int {
+	if flushSize <= 0 {
+		return maxBufferedEventsFactor
+	}
+	if flushSize > int(^uint(0)>>1)/maxBufferedEventsFactor {
+		return flushSize
+	}
+	return flushSize * maxBufferedEventsFactor
 }

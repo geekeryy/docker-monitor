@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -70,9 +71,11 @@ func run() error {
 
 		go func() {
 			defer wg.Done()
-			if err := instance.aggregator.Run(ctx); err != nil && ctx.Err() == nil {
+			if err := instance.aggregator.Run(ctx); err != nil {
 				errCh <- fmt.Errorf("docker host %s aggregator stopped: %w", instance.label, err)
-				stop()
+				if ctx.Err() == nil {
+					stop()
+				}
 			}
 		}()
 
@@ -94,11 +97,21 @@ func run() error {
 
 	<-ctx.Done()
 	wg.Wait()
+	var shutdownErrs []error
+	for _, instance := range instances {
+		if err := instance.aggregator.FlushAll(context.Background()); err != nil {
+			shutdownErrs = append(shutdownErrs, fmt.Errorf("docker host %s final flush failed: %w", instance.label, err))
+		}
+	}
+	for _, instance := range instances {
+		if err := instance.outputStore.Close(); err != nil {
+			shutdownErrs = append(shutdownErrs, fmt.Errorf("docker host %s store shutdown failed: %w", instance.label, err))
+		}
+	}
+	close(errCh)
 
-	select {
-	case err := <-errCh:
+	if err := errors.Join(append(shutdownErrs, collectErrors(errCh))...); err != nil {
 		return err
-	default:
 	}
 
 	logger.Info("monitor stopped")
@@ -106,10 +119,11 @@ func run() error {
 }
 
 type monitorInstance struct {
-	label      string
-	client     *dockermonitor.Client
-	aggregator *aggregator.Aggregator
-	watcher    *dockermonitor.Watcher
+	label       string
+	client      *dockermonitor.Client
+	outputStore *store.MultiStore
+	aggregator  *aggregator.Aggregator
+	watcher     *dockermonitor.Watcher
 }
 
 func newMonitorInstances(ctx context.Context, hostConfigs []config.ResolvedHostConfig, monitorStartedAt time.Time, logger *slog.Logger) ([]monitorInstance, error) {
@@ -129,6 +143,7 @@ func newMonitorInstances(ctx context.Context, hostConfigs []config.ResolvedHostC
 
 		client, err := newDockerClient(hostConfig.Host)
 		if err != nil {
+			closeMonitorInstances(instances)
 			return nil, err
 		}
 
@@ -152,7 +167,9 @@ func newMonitorInstances(ctx context.Context, hostConfigs []config.ResolvedHostC
 		)
 		selfContainerID, err := dockermonitor.DetectSelfContainerID(ctx, client)
 		if err != nil {
+			_ = outputStore.Close()
 			_ = client.Close()
+			closeMonitorInstances(instances)
 			return nil, fmt.Errorf("detect self container on docker host %s: %w", label, err)
 		}
 		if selfContainerID != "" {
@@ -161,7 +178,9 @@ func newMonitorInstances(ctx context.Context, hostConfigs []config.ResolvedHostC
 
 		logParser, err := parser.New(cfg.Filters, cfg.Aggregation.UnknownLogID)
 		if err != nil {
+			_ = outputStore.Close()
 			_ = client.Close()
+			closeMonitorInstances(instances)
 			return nil, err
 		}
 
@@ -187,14 +206,32 @@ func newMonitorInstances(ctx context.Context, hostConfigs []config.ResolvedHostC
 		}, instanceLogger)
 
 		instances = append(instances, monitorInstance{
-			label:      label,
-			client:     client,
-			aggregator: logAggregator,
-			watcher:    watcher,
+			label:       label,
+			client:      client,
+			outputStore: outputStore,
+			aggregator:  logAggregator,
+			watcher:     watcher,
 		})
 	}
 
 	return instances, nil
+}
+
+func collectErrors(errCh <-chan error) error {
+	var errs []error
+	for err := range errCh {
+		if err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func closeMonitorInstances(instances []monitorInstance) {
+	for _, instance := range instances {
+		_ = instance.outputStore.Close()
+		_ = instance.client.Close()
+	}
 }
 
 func resolvedDockerHosts(hostConfigs []config.ResolvedHostConfig) []string {

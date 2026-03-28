@@ -273,3 +273,38 @@ func TestBuildDingTalkMarkdownRespectsMaxEvents(t *testing.T) {
 		t.Fatalf("markdown text = %q, want omission summary", text)
 	}
 }
+
+func TestBuildDingTalkMarkdownFormatsTimesInLocalZone(t *testing.T) {
+	t.Parallel()
+
+	utcPlus8 := time.FixedZone("UTC+8", 8*60*60)
+	firstSeen := time.Date(2026, 3, 24, 10, 0, 0, 0, time.UTC)
+	lastSeen := time.Date(2026, 3, 24, 10, 2, 0, 0, time.UTC)
+	eventTime := time.Date(2026, 3, 24, 10, 1, 0, 0, time.UTC)
+
+	text := buildDingTalkMarkdownWithLocation(model.LogBatch{
+		LogID:      "tz-1",
+		FirstSeen:  firstSeen,
+		LastSeen:   lastSeen,
+		Count:      1,
+		Containers: []string{"local-dev-api"},
+		Events: []model.LogEvent{
+			{
+				Timestamp: eventTime,
+				Container: model.ContainerInfo{Name: "local-dev-api"},
+				Level:     "WARN",
+				Raw:       "event detail",
+			},
+		},
+	}, 5, utcPlus8)
+
+	if !strings.Contains(text, "- 首次时间: `2026-03-24 18:00:00 +08:00`") {
+		t.Fatalf("markdown text = %q, want localized first_seen", text)
+	}
+	if !strings.Contains(text, "- 最后时间: `2026-03-24 18:02:00 +08:00`") {
+		t.Fatalf("markdown text = %q, want localized last_seen", text)
+	}
+	if !strings.Contains(text, "`2026-03-24 18:01:00 +08:00` `local-dev-api` `WARN`") {
+		t.Fatalf("markdown text = %q, want localized event timestamp", text)
+	}
+}

@@ -27,6 +27,8 @@ type DingTalkStore struct {
 	client        *http.Client
 }
 
+const maxDingTalkResponseBytes = 1 << 20
+
 type dingTalkPayload struct {
 	MsgType  string               `json:"msgtype"`
 	Markdown dingTalkMarkdownBody `json:"markdown,omitempty"`
@@ -139,7 +141,7 @@ func (s *DingTalkStore) sendPayload(ctx context.Context, payload dingTalkPayload
 	defer closeSilently(resp.Body)
 
 	var result dingTalkResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxDingTalkResponseBytes)).Decode(&result); err != nil {
 		return fmt.Errorf("decode dingtalk response: %w", err)
 	}
 	if resp.StatusCode >= 300 {
@@ -173,6 +175,10 @@ func signedWebhookURL(rawURL, secret string) (string, error) {
 }
 
 func buildDingTalkMarkdown(batch model.LogBatch, maxEvents int) string {
+	return buildDingTalkMarkdownWithLocation(batch, maxEvents, time.Local)
+}
+
+func buildDingTalkMarkdownWithLocation(batch model.LogBatch, maxEvents int, location *time.Location) string {
 	var builder strings.Builder
 	builder.WriteString("### ")
 	builder.WriteString(buildDingTalkTitle(batch))
@@ -183,8 +189,8 @@ func buildDingTalkMarkdown(batch model.LogBatch, maxEvents int) string {
 	builder.WriteString(fmt.Sprintf("- LogID: `%s`\n", batch.LogID))
 	builder.WriteString(fmt.Sprintf("- 日志条数: `%d`\n", batch.Count))
 	builder.WriteString(fmt.Sprintf("- 容器: `%s`\n", strings.Join(batch.Containers, ", ")))
-	builder.WriteString(fmt.Sprintf("- 首次时间: `%s`\n", batch.FirstSeen.Format(time.RFC3339)))
-	builder.WriteString(fmt.Sprintf("- 最后时间: `%s`\n", batch.LastSeen.Format(time.RFC3339)))
+	builder.WriteString(fmt.Sprintf("- 首次时间: `%s`\n", formatDisplayTimeInLocation(batch.FirstSeen, location)))
+	builder.WriteString(fmt.Sprintf("- 最后时间: `%s`\n", formatDisplayTimeInLocation(batch.LastSeen, location)))
 	builder.WriteString("\n#### 最近日志\n")
 
 	if maxEvents <= 0 {
@@ -196,7 +202,7 @@ func buildDingTalkMarkdown(batch model.LogBatch, maxEvents int) string {
 			break
 		}
 		builder.WriteString(fmt.Sprintf("\n- `%s` `%s` `%s`",
-			event.Timestamp.Format("15:04:05"),
+			formatDisplayTimeInLocation(event.Timestamp, location),
 			event.Container.Name,
 			emptyAsDash(event.Level),
 		))
@@ -206,6 +212,20 @@ func buildDingTalkMarkdown(batch model.LogBatch, maxEvents int) string {
 	}
 
 	return builder.String()
+}
+
+func formatDisplayTime(ts time.Time) string {
+	return formatDisplayTimeInLocation(ts, time.Local)
+}
+
+func formatDisplayTimeInLocation(ts time.Time, location *time.Location) string {
+	if ts.IsZero() {
+		return "-"
+	}
+	if location == nil {
+		location = time.Local
+	}
+	return ts.In(location).Format("2006-01-02 15:04:05 -07:00")
 }
 
 func detailedLog(event model.LogEvent) string {

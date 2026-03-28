@@ -91,10 +91,7 @@ func (p *Parser) Parse(raw model.RawLog) (*model.LogEvent, bool, error) {
 	}
 
 	parsedJSON := map[string]any{}
-	if json.Valid([]byte(line)) {
-		if err := json.Unmarshal([]byte(line), &parsedJSON); err != nil {
-			return nil, false, fmt.Errorf("unmarshal json log: %w", err)
-		}
+	if err := json.Unmarshal([]byte(line), &parsedJSON); err == nil {
 		event.ParsedFromJSON = true
 		event.Message = coalesceString(parsedJSON, p.messageFields, line)
 		if ts, ok := parseTimestamp(parsedJSON, p.timeFields); ok {
@@ -191,17 +188,17 @@ func parseTimestamp(payload map[string]any, keys []string) (time.Time, bool) {
 }
 
 func parseTimestampString(value string) (time.Time, bool) {
-	layouts := []string{
-		time.RFC3339Nano,
-		time.RFC3339,
-		"2006-01-02 15:04:05",
-		"2006-01-02 15:04:05.000",
+	if ts, err := time.Parse(time.RFC3339Nano, value); err == nil {
+		return ts, true
 	}
-	for _, layout := range layouts {
-		ts, err := time.Parse(layout, value)
-		if err == nil {
-			return ts.UTC(), true
-		}
+	if ts, err := time.Parse(time.RFC3339, value); err == nil {
+		return ts, true
+	}
+	if ts, err := time.ParseInLocation("2006-01-02 15:04:05", value, time.Local); err == nil {
+		return ts, true
+	}
+	if ts, err := time.ParseInLocation("2006-01-02 15:04:05.000", value, time.Local); err == nil {
+		return ts, true
 	}
 	if unixSeconds, err := strconv.ParseInt(value, 10, 64); err == nil {
 		return time.Unix(unixSeconds, 0).UTC(), true

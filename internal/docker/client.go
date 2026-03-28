@@ -3,6 +3,7 @@ package docker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -59,6 +60,9 @@ type EventMessage struct {
 	Actor  EventActor `json:"Actor"`
 	Time   int64      `json:"time,omitempty"`
 }
+
+const dockerShortRequestTimeout = 10 * time.Second
+const dockerEventBufferSize = 64
 
 func NewClient(host string) (*Client, error) {
 	resolvedHost := host
@@ -124,6 +128,9 @@ func (c *Client) Close() error {
 }
 
 func (c *Client) ContainerList(ctx context.Context, options ContainerListOptions) ([]ContainerSummary, error) {
+	ctx, cancel := withRequestTimeout(ctx, dockerShortRequestTimeout)
+	defer cancel()
+
 	query := url.Values{}
 	if options.All {
 		query.Set("all", "1")
@@ -146,6 +153,9 @@ func (c *Client) ContainerInspect(ctx context.Context, containerID string) (Cont
 	if strings.TrimSpace(containerID) == "" {
 		return ContainerJSON{}, fmt.Errorf("container id is empty")
 	}
+
+	ctx, cancel := withRequestTimeout(ctx, dockerShortRequestTimeout)
+	defer cancel()
 
 	resp, err := c.do(ctx, http.MethodGet, "/containers/"+containerID+"/json", nil)
 	if err != nil {
@@ -190,7 +200,7 @@ func (c *Client) ContainerLogs(ctx context.Context, containerID string, options 
 }
 
 func (c *Client) Events(ctx context.Context, options EventsOptions) (<-chan EventMessage, <-chan error) {
-	msgCh := make(chan EventMessage)
+	msgCh := make(chan EventMessage, dockerEventBufferSize)
 	errCh := make(chan error, 1)
 
 	go func() {
@@ -224,7 +234,7 @@ func (c *Client) Events(ctx context.Context, options EventsOptions) (<-chan Even
 		for {
 			var event EventMessage
 			if err := decoder.Decode(&event); err != nil {
-				if err == io.EOF || context.Canceled == ctx.Err() {
+				if err == io.EOF || errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
 					return
 				}
 				errCh <- err
@@ -269,5 +279,12 @@ func FormatSince(ts time.Time) string {
 	if ts.IsZero() {
 		return ""
 	}
-	return fmt.Sprintf("%d", ts.UTC().Unix())
+	return ts.UTC().Format(time.RFC3339Nano)
+}
+
+func withRequestTimeout(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if _, hasDeadline := ctx.Deadline(); hasDeadline || timeout <= 0 {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, timeout)
 }

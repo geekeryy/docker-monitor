@@ -31,6 +31,7 @@ type Watcher struct {
 	mu     sync.Mutex
 	active map[string]activeStream
 	ids    map[string]string
+	wg     sync.WaitGroup
 }
 
 type activeStream struct {
@@ -61,6 +62,11 @@ func NewWatcher(client DiscoveryClient, reader *LogReader, includePatterns []str
 }
 
 func (w *Watcher) Run(ctx context.Context) error {
+	defer func() {
+		w.stopAll()
+		w.wg.Wait()
+	}()
+
 	containers, err := w.client.ContainerList(ctx, ContainerListOptions{})
 	if err != nil {
 		return err
@@ -74,7 +80,6 @@ func (w *Watcher) Run(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
-			w.stopAll()
 			return nil
 		case msg, ok := <-msgCh:
 			if !ok {
@@ -140,7 +145,11 @@ func (w *Watcher) maybeStart(ctx context.Context, summary ContainerSummary) {
 		return
 	}
 
-	go w.runStream(ctx, streamCtx, info)
+	w.wg.Add(1)
+	go func() {
+		defer w.wg.Done()
+		w.runStream(ctx, streamCtx, info)
+	}()
 }
 
 func (w *Watcher) runStream(rootCtx, ctx context.Context, info model.ContainerInfo) {
@@ -152,7 +161,9 @@ func (w *Watcher) runStream(rootCtx, ctx context.Context, info model.ContainerIn
 	}
 	for {
 		err := w.reader.Stream(ctx, info, lastSeen, func(streamCtx context.Context, raw model.RawLog) error {
-			lastSeen = raw.Timestamp
+			if !raw.Timestamp.IsZero() {
+				lastSeen = raw.Timestamp
+			}
 			return w.handler(streamCtx, raw)
 		})
 		if errors.Is(err, context.Canceled) {

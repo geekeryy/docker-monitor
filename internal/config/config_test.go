@@ -283,6 +283,37 @@ func TestConfigValidateRejectsNonPositiveDingTalkMaxEvents(t *testing.T) {
 	}
 }
 
+func TestConfigValidateRejectsBlankWebhookWhenSecretConfigured(t *testing.T) {
+	t.Parallel()
+
+	cfg := defaultConfig()
+	cfg.DingTalk.Secret = "secret"
+	cfg.DingTalk.WebhookURL = "   "
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("Validate() error = nil, want error")
+	}
+	if !strings.Contains(err.Error(), "dingtalk.webhook_url must not be empty") {
+		t.Fatalf("Validate() error = %v, want blank webhook validation error", err)
+	}
+}
+
+func TestConfigValidateRejectsUnsupportedWebhookScheme(t *testing.T) {
+	t.Parallel()
+
+	cfg := defaultConfig()
+	cfg.DingTalk.WebhookURL = "ftp://example.com/hook"
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("Validate() error = nil, want error")
+	}
+	if !strings.Contains(err.Error(), "dingtalk.webhook_url must use http or https") {
+		t.Fatalf("Validate() error = %v, want webhook scheme validation error", err)
+	}
+}
+
 func stringPtr(value string) *string {
 	return &value
 }

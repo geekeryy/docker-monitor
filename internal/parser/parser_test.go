@@ -278,6 +278,34 @@ func TestParseSkipsJSONLogMatchedByExcludeRegexp(t *testing.T) {
 	}
 }
 
+func TestParseTimestampStringPreservesExplicitOffset(t *testing.T) {
+	t.Parallel()
+
+	ts, ok := parseTimestampString("2026-03-24T10:20:30+08:00")
+	if !ok {
+		t.Fatal("parseTimestampString() ok = false, want true")
+	}
+	if got := ts.Format(time.RFC3339); got != "2026-03-24T10:20:30+08:00" {
+		t.Fatalf("timestamp = %q, want preserved offset", got)
+	}
+}
+
+func TestParseTimestampStringUsesLocalZoneForNaiveTimestamp(t *testing.T) {
+	t.Parallel()
+
+	ts, ok := parseTimestampString("2026-03-24 10:20:30")
+	if !ok {
+		t.Fatal("parseTimestampString() ok = false, want true")
+	}
+	expected := time.Date(2026, 3, 24, 10, 20, 30, 0, time.Local)
+	if !ts.Equal(expected) {
+		t.Fatalf("timestamp = %s, want %s", ts, expected)
+	}
+	if ts.Location() != time.Local {
+		t.Fatalf("location = %v, want time.Local", ts.Location())
+	}
+}
+
 func TestNewRejectsInvalidExcludeRegexp(t *testing.T) {
 	t.Parallel()
 

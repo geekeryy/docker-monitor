@@ -79,8 +79,13 @@ type lineWriter struct {
 	handler   LineHandler
 
 	mu     sync.Mutex
-	buffer string
+	buffer []byte
 }
+
+const (
+	maxDockerLogFrameSize = 4 << 20
+	maxDockerLogLineSize  = 1 << 20
+)
 
 func newLineWriter(ctx context.Context, containerInfo model.ContainerInfo, stream string, handler LineHandler) *lineWriter {
 	return &lineWriter{
@@ -95,14 +100,17 @@ func (w *lineWriter) Write(p []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	w.buffer += string(p)
+	w.buffer = append(w.buffer, p...)
+	if len(w.buffer) > maxDockerLogLineSize {
+		return 0, fmt.Errorf("docker log line exceeds %d bytes", maxDockerLogLineSize)
+	}
 	for {
-		idx := strings.IndexByte(w.buffer, '\n')
+		idx := bytes.IndexByte(w.buffer, '\n')
 		if idx < 0 {
 			break
 		}
-		line := strings.TrimRight(w.buffer[:idx], "\r")
-		w.buffer = w.buffer[idx+1:]
+		line := bytes.TrimRight(w.buffer[:idx], "\r")
+		w.buffer = append([]byte(nil), w.buffer[idx+1:]...)
 		if err := w.emit(line); err != nil {
 			return 0, err
 		}
@@ -115,20 +123,21 @@ func (w *lineWriter) Flush() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	if w.buffer == "" {
+	if len(w.buffer) == 0 {
 		return nil
 	}
-	line := strings.TrimRight(w.buffer, "\r")
-	w.buffer = ""
+	line := bytes.TrimRight(w.buffer, "\r")
+	w.buffer = nil
 	return w.emit(line)
 }
 
-func (w *lineWriter) emit(line string) error {
-	if strings.TrimSpace(line) == "" {
+func (w *lineWriter) emit(line []byte) error {
+	content := string(line)
+	if len(bytes.TrimSpace(line)) == 0 {
 		return nil
 	}
 
-	ts, content := splitDockerTimestamp(line)
+	ts, content := splitDockerTimestamp(content)
 	return w.handler(w.ctx, model.RawLog{
 		Timestamp: ts,
 		Container: w.container,
@@ -141,10 +150,10 @@ func splitDockerTimestamp(line string) (time.Time, string) {
 	parts := strings.SplitN(line, " ", 2)
 	if len(parts) == 2 {
 		if ts, err := time.Parse(time.RFC3339Nano, parts[0]); err == nil {
-			return ts.UTC(), parts[1]
+			return ts, parts[1]
 		}
 	}
-	return time.Now().UTC(), line
+	return time.Time{}, line
 }
 
 func isClosedPipe(err error) bool {
@@ -174,6 +183,9 @@ func copyDockerLogs(src io.Reader, stdoutWriter, stderrWriter io.Writer) error {
 	for {
 		streamType := header[0]
 		size := binary.BigEndian.Uint32(header[4:])
+		if size > maxDockerLogFrameSize {
+			return fmt.Errorf("docker log frame exceeds %d bytes", maxDockerLogFrameSize)
+		}
 		payload := make([]byte, size)
 		if _, err := io.ReadFull(reader, payload); err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {

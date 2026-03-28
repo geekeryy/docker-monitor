@@ -237,3 +237,34 @@ func TestAggregatorFlushesUnknownLogIDIndividually(t *testing.T) {
 		}
 	}
 }
+
+func TestAggregatorBoundsBufferedEventsForKnownLogIDWithoutAlert(t *testing.T) {
+	t.Parallel()
+
+	store := &memoryStore{}
+	agg := New(store, 2, time.Minute, "unknown")
+
+	for i := 0; i < 25; i++ {
+		err := agg.Add(context.Background(), model.LogEvent{
+			Timestamp:    time.Unix(int64(i), 0).UTC(),
+			LogID:        "known-id",
+			AlertMatched: false,
+			Container:    model.ContainerInfo{Name: "app-1"},
+			Message:      "context",
+		})
+		if err != nil {
+			t.Fatalf("Add(%d) error = %v", i, err)
+		}
+	}
+
+	buffer := agg.groups["known-id"]
+	if buffer == nil {
+		t.Fatal("buffer for known-id = nil, want retained context")
+	}
+	if got, want := len(buffer.events), agg.maxGroupSize; got != want {
+		t.Fatalf("len(buffer.events) = %d, want %d", got, want)
+	}
+	if got := buffer.events[0].Timestamp; !got.Equal(time.Unix(5, 0).UTC()) {
+		t.Fatalf("first retained timestamp = %s, want %s", got, time.Unix(5, 0).UTC())
+	}
+}
