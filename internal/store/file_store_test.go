@@ -55,3 +55,46 @@ func TestFileStoreWritesSingleDailyFileInMonthlyDir(t *testing.T) {
 		t.Fatalf("len(lines) = %d, want 2", len(lines))
 	}
 }
+
+func TestFileStoreWritesHealthEventsToSeparateDailyFile(t *testing.T) {
+	t.Parallel()
+
+	baseDir := t.TempDir()
+	s := NewFileStore(baseDir)
+
+	ts := time.Date(2026, 4, 1, 10, 0, 0, 0, time.UTC)
+	err := s.AppendBatch(context.Background(), model.LogBatch{
+		LogID:     "warn-1",
+		LastSeen:  ts,
+		Count:     1,
+		FlushedAt: time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatalf("AppendBatch(normal) error = %v", err)
+	}
+
+	err = s.AppendBatch(context.Background(), model.LogBatch{
+		LogID:     "monitor.health.docker.event_stream",
+		LastSeen:  ts,
+		Count:     1,
+		FlushedAt: time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatalf("AppendBatch(health) error = %v", err)
+	}
+
+	entries, err := os.ReadDir(filepath.Join(baseDir, "2026-04"))
+	if err != nil {
+		t.Fatalf("ReadDir() error = %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("len(entries) = %d, want 2", len(entries))
+	}
+
+	if _, err := os.Stat(filepath.Join(baseDir, "2026-04", "2026-04-01.jsonl")); err != nil {
+		t.Fatalf("Stat(normal file) error = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(baseDir, "2026-04", "2026-04-01.health.jsonl")); err != nil {
+		t.Fatalf("Stat(health file) error = %v", err)
+	}
+}

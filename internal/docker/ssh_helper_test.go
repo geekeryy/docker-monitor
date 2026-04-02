@@ -63,3 +63,37 @@ func TestDockerDialStdioArgs(t *testing.T) {
 		t.Fatalf("dockerDialStdioArgs(socket) = %v, want [%s system dial-stdio]", got, wantFirst)
 	}
 }
+
+func TestSSHSpecCommandAddsKeepaliveOptions(t *testing.T) {
+	t.Parallel()
+
+	spec := sshSpec{
+		User: "root",
+		Host: "example.com",
+		Port: "2222",
+	}
+
+	got, err := spec.command("docker", "system", "dial-stdio")
+	if err != nil {
+		t.Fatalf("spec.command() error = %v", err)
+	}
+
+	want := []string{
+		"-l", "root",
+		"-p", "2222",
+		"-o", "ConnectTimeout=30",
+		"-o", "ServerAliveInterval=30",
+		"-o", "ServerAliveCountMax=3",
+		"-T", "--", "example.com",
+		"'docker' 'system' 'dial-stdio'",
+	}
+
+	if len(got) != len(want) {
+		t.Fatalf("len(spec.command()) = %d, want %d; got %v", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("spec.command()[%d] = %q, want %q; full=%v", i, got[i], want[i], got)
+		}
+	}
+}

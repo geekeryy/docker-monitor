@@ -91,7 +91,12 @@ func (s *sshSpec) command(remoteCmd string, remoteArgs ...string) ([]string, err
 		}
 		args = append(args, "-p", s.Port)
 	}
-	args = append(args, "-o", "ConnectTimeout=30", "-T", "--", s.Host)
+	args = append(args,
+		"-o", "ConnectTimeout=30",
+		"-o", "ServerAliveInterval=30",
+		"-o", "ServerAliveCountMax=3",
+		"-T", "--", s.Host,
+	)
 	args = append(args, shellJoin(append([]string{remoteCmd}, remoteArgs...)...))
 	return args, nil
 }

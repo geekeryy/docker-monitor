@@ -35,7 +35,7 @@ func (s *FileStore) AppendBatch(_ context.Context, batch model.LogBatch) error {
 		return fmt.Errorf("create output dir: %w", err)
 	}
 
-	target := filepath.Join(dir, ts.Format("2006-01-02")+".jsonl")
+	target := filepath.Join(dir, fileStoreName(batch, ts))
 	file, err := os.OpenFile(target, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		return fmt.Errorf("open output file: %w", err)
@@ -55,4 +55,12 @@ func (s *FileStore) AppendBatch(_ context.Context, batch model.LogBatch) error {
 	}
 
 	return nil
+}
+
+func fileStoreName(batch model.LogBatch, ts time.Time) string {
+	date := ts.Format("2006-01-02")
+	if isHealthBatch(batch) {
+		return date + ".health.jsonl"
+	}
+	return date + ".jsonl"
 }

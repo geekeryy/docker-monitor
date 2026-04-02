@@ -78,14 +78,17 @@ type lineWriter struct {
 	stream    string
 	handler   LineHandler
 
-	mu     sync.Mutex
-	buffer []byte
+	mu        sync.Mutex
+	buffer    []byte
+	truncated bool
 }
 
 const (
 	maxDockerLogFrameSize = 4 << 20
 	maxDockerLogLineSize  = 1 << 20
 )
+
+const dockerLogLineTruncatedSuffix = " [truncated: docker log line exceeded limit]"
 
 func newLineWriter(ctx context.Context, containerInfo model.ContainerInfo, stream string, handler LineHandler) *lineWriter {
 	return &lineWriter{
@@ -100,20 +103,46 @@ func (w *lineWriter) Write(p []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	w.buffer = append(w.buffer, p...)
-	if len(w.buffer) > maxDockerLogLineSize {
-		return 0, fmt.Errorf("docker log line exceeds %d bytes", maxDockerLogLineSize)
-	}
-	for {
-		idx := bytes.IndexByte(w.buffer, '\n')
-		if idx < 0 {
-			break
+	remaining := p
+	for len(remaining) > 0 {
+		if w.truncated {
+			idx := bytes.IndexByte(remaining, '\n')
+			if idx < 0 {
+				return len(p), nil
+			}
+			if err := w.emitLine(bytes.TrimRight(w.buffer, "\r"), true); err != nil {
+				return 0, err
+			}
+			w.buffer = nil
+			w.truncated = false
+			remaining = remaining[idx+1:]
+			continue
 		}
-		line := bytes.TrimRight(w.buffer[:idx], "\r")
-		w.buffer = append([]byte(nil), w.buffer[idx+1:]...)
-		if err := w.emit(line); err != nil {
-			return 0, err
+
+		available := maxDockerLogLineSize - len(w.buffer)
+		if available <= 0 {
+			w.truncated = true
+			continue
 		}
+
+		if idx := bytes.IndexByte(remaining, '\n'); idx >= 0 && idx <= available {
+			w.buffer = append(w.buffer, remaining[:idx]...)
+			if err := w.emitLine(bytes.TrimRight(w.buffer, "\r"), false); err != nil {
+				return 0, err
+			}
+			w.buffer = nil
+			remaining = remaining[idx+1:]
+			continue
+		}
+
+		if len(remaining) <= available {
+			w.buffer = append(w.buffer, remaining...)
+			return len(p), nil
+		}
+
+		w.buffer = append(w.buffer, remaining[:available]...)
+		w.truncated = true
+		remaining = remaining[available:]
 	}
 
 	return len(p), nil
@@ -124,17 +153,23 @@ func (w *lineWriter) Flush() error {
 	defer w.mu.Unlock()
 
 	if len(w.buffer) == 0 {
+		w.truncated = false
 		return nil
 	}
 	line := bytes.TrimRight(w.buffer, "\r")
 	w.buffer = nil
-	return w.emit(line)
+	truncated := w.truncated
+	w.truncated = false
+	return w.emitLine(line, truncated)
 }
 
-func (w *lineWriter) emit(line []byte) error {
+func (w *lineWriter) emitLine(line []byte, truncated bool) error {
 	content := string(line)
 	if len(bytes.TrimSpace(line)) == 0 {
 		return nil
+	}
+	if truncated {
+		content += dockerLogLineTruncatedSuffix
 	}
 
 	ts, content := splitDockerTimestamp(content)

@@ -204,6 +204,8 @@ func newMonitorInstances(ctx context.Context, hostConfigs []config.ResolvedHostC
 			}
 			return logAggregator.Add(streamCtx, *event)
 		}, instanceLogger)
+		watcher.SetHealthSink(outputStore)
+		watcher.SetHealthContainerName(label + "/monitor")
 
 		instances = append(instances, monitorInstance{
 			label:       label,

@@ -308,3 +308,63 @@ func TestBuildDingTalkMarkdownFormatsTimesInLocalZone(t *testing.T) {
 		t.Fatalf("markdown text = %q, want localized event timestamp", text)
 	}
 }
+
+func TestDingTalkStoreAppendBatchHealthErrorMentionsConfiguredUsers(t *testing.T) {
+	t.Parallel()
+
+	var receivedPayloads []dingTalkPayload
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload dingTalkPayload
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("Decode() error = %v", err)
+		}
+		receivedPayloads = append(receivedPayloads, payload)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"errcode":0,"errmsg":"ok"}`))
+	}))
+	defer server.Close()
+
+	store := NewDingTalkStore(server.URL+"?access_token=test-token", "test-secret", false, []string{"13800000000"}, []string{"ERROR"}, 5)
+	err := store.AppendBatch(context.Background(), model.LogBatch{
+		LogID:      "monitor.health.docker.event_stream",
+		FirstSeen:  time.Date(2026, 4, 1, 10, 0, 0, 0, time.UTC),
+		LastSeen:   time.Date(2026, 4, 1, 10, 0, 0, 0, time.UTC),
+		Count:      1,
+		Containers: []string{"prod-a/monitor"},
+		Events: []model.LogEvent{
+			{
+				Timestamp: time.Date(2026, 4, 1, 10, 0, 0, 0, time.UTC),
+				Container: model.ContainerInfo{Name: "prod-a/monitor"},
+				Level:     "ERROR",
+				Message:   "docker event stream entered degraded state",
+				Raw:       "docker event stream entered degraded state: ssh session closed\nconsecutive_failures=3",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("AppendBatch() error = %v", err)
+	}
+
+	if got := len(receivedPayloads); got != 2 {
+		t.Fatalf("len(receivedPayloads) = %d, want 2", got)
+	}
+	if got := receivedPayloads[0].Markdown.Title; got != "Docker监控健康告警 monitor.health.docker.event_stream [prod-a]" {
+		t.Fatalf("markdown title = %q, want health title with host", got)
+	}
+	if !strings.Contains(receivedPayloads[0].Markdown.Text, "- 状态: `ERROR`") {
+		t.Fatalf("markdown text = %q, want health status", receivedPayloads[0].Markdown.Text)
+	}
+	if !strings.Contains(receivedPayloads[0].Markdown.Text, "- 组件: `docker.event_stream`") {
+		t.Fatalf("markdown text = %q, want health component", receivedPayloads[0].Markdown.Text)
+	}
+	if !strings.Contains(receivedPayloads[0].Markdown.Text, "docker event stream entered degraded state") {
+		t.Fatalf("markdown text = %q, want health message", receivedPayloads[0].Markdown.Text)
+	}
+	if !strings.Contains(receivedPayloads[1].Text.Content, "Docker监控健康告警 [prod-a] docker event stream entered degraded state") {
+		t.Fatalf("text content = %q, want health mention summary", receivedPayloads[1].Text.Content)
+	}
+	if !strings.Contains(receivedPayloads[1].Text.Content, "@13800000000") {
+		t.Fatalf("text content = %q, want mention", receivedPayloads[1].Text.Content)
+	}
+}

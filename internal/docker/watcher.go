@@ -3,6 +3,8 @@ package docker
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"log/slog"
 	"path/filepath"
 	"strings"
@@ -22,9 +24,12 @@ type Watcher struct {
 	reader          *LogReader
 	includePatterns []string
 	ignoredID       string
+	healthSink      healthEventSink
+	healthContainer string
 	startedAt       time.Time
 	initialSince    time.Duration
 	reconnectDelay  time.Duration
+	eventRetryDelay time.Duration
 	handler         LineHandler
 	logger          *slog.Logger
 
@@ -39,6 +44,12 @@ type activeStream struct {
 	cancel context.CancelFunc
 }
 
+type healthEventSink interface {
+	AppendBatch(ctx context.Context, batch model.LogBatch) error
+}
+
+const degradedFailureThreshold = 3
+
 func NewWatcher(client DiscoveryClient, reader *LogReader, includePatterns []string, ignoredID string, startedAt time.Time, initialSince time.Duration, handler LineHandler, logger *slog.Logger) *Watcher {
 	if logger == nil {
 		logger = slog.Default()
@@ -51,14 +62,28 @@ func NewWatcher(client DiscoveryClient, reader *LogReader, includePatterns []str
 		reader:          reader,
 		includePatterns: includePatterns,
 		ignoredID:       strings.TrimSpace(ignoredID),
+		healthContainer: "monitor",
 		startedAt:       startedAt.UTC(),
 		initialSince:    initialSince,
 		reconnectDelay:  3 * time.Second,
+		eventRetryDelay: 3 * time.Second,
 		handler:         handler,
 		logger:          logger,
 		active:          make(map[string]activeStream),
 		ids:             make(map[string]string),
 	}
+}
+
+func (w *Watcher) SetHealthSink(sink healthEventSink) {
+	w.healthSink = sink
+}
+
+func (w *Watcher) SetHealthContainerName(name string) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return
+	}
+	w.healthContainer = name
 }
 
 func (w *Watcher) Run(ctx context.Context) error {
@@ -67,6 +92,69 @@ func (w *Watcher) Run(ctx context.Context) error {
 		w.wg.Wait()
 	}()
 
+	var syncFailures int
+	var eventFailures int
+
+	for {
+		if err := w.syncContainers(ctx); err != nil {
+			if err == nil || errors.Is(err, context.Canceled) {
+				return nil
+			}
+
+			syncFailures++
+			w.logRetryFailure("docker container sync failed, retrying", err, syncFailures)
+			if syncFailures == degradedFailureThreshold {
+				w.reportHealthEvent(ctx, "docker.container_sync", "ERROR", "docker container sync entered degraded state", err, syncFailures)
+			}
+
+			if !w.waitForEventRetry(ctx) {
+				return nil
+			}
+			continue
+		}
+		if syncFailures > 0 {
+			w.logRecovery("docker container sync recovered", syncFailures)
+			if syncFailures >= degradedFailureThreshold {
+				w.reportHealthEvent(ctx, "docker.container_sync", "INFO", "docker container sync recovered", nil, syncFailures)
+			}
+			syncFailures = 0
+		}
+
+		err := w.runEventLoop(ctx, func() {
+			if eventFailures > 0 {
+				w.logRecovery("docker event stream recovered", eventFailures)
+				if eventFailures >= degradedFailureThreshold {
+					w.reportHealthEvent(ctx, "docker.event_stream", "INFO", "docker event stream recovered", nil, eventFailures)
+				}
+				eventFailures = 0
+			}
+		})
+		if err == nil || errors.Is(err, context.Canceled) {
+			return nil
+		}
+
+		eventFailures++
+		w.logRetryFailure("docker event stream disconnected, retrying", err, eventFailures)
+		if eventFailures == degradedFailureThreshold {
+			w.reportHealthEvent(ctx, "docker.event_stream", "ERROR", "docker event stream entered degraded state", err, eventFailures)
+		}
+
+		if !w.waitForEventRetry(ctx) {
+			return nil
+		}
+	}
+}
+
+func (w *Watcher) waitForEventRetry(ctx context.Context) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case <-time.After(w.eventRetryDelay):
+		return true
+	}
+}
+
+func (w *Watcher) syncContainers(ctx context.Context) error {
 	containers, err := w.client.ContainerList(ctx, ContainerListOptions{})
 	if err != nil {
 		return err
@@ -74,8 +162,12 @@ func (w *Watcher) Run(ctx context.Context) error {
 	for _, summary := range containers {
 		w.maybeStart(ctx, summary)
 	}
+	return nil
+}
 
+func (w *Watcher) runEventLoop(ctx context.Context, onEvent func()) error {
 	msgCh, errCh := w.client.Events(ctx, EventsOptions{Filters: map[string][]string{"type": {"container"}}})
+	seenEvent := false
 
 	for {
 		select {
@@ -84,12 +176,24 @@ func (w *Watcher) Run(ctx context.Context) error {
 		case msg, ok := <-msgCh:
 			if !ok {
 				msgCh = nil
+				if errCh == nil {
+					return io.EOF
+				}
 				continue
+			}
+			if !seenEvent {
+				seenEvent = true
+				if onEvent != nil {
+					onEvent()
+				}
 			}
 			w.handleEvent(ctx, msg)
 		case err, ok := <-errCh:
 			if !ok {
 				errCh = nil
+				if msgCh == nil {
+					return io.EOF
+				}
 				continue
 			}
 			if err == nil || errors.Is(err, context.Canceled) {
@@ -97,10 +201,69 @@ func (w *Watcher) Run(ctx context.Context) error {
 			}
 			return err
 		}
+	}
+}
 
-		if msgCh == nil && errCh == nil {
-			return nil
-		}
+func (w *Watcher) logRetryFailure(msg string, err error, failures int) {
+	attrs := []any{
+		slog.Int("consecutive_failures", failures),
+	}
+	if err != nil {
+		attrs = append(attrs, slog.String("error", err.Error()))
+	}
+
+	if failures >= degradedFailureThreshold {
+		w.logger.Error(msg, attrs...)
+		return
+	}
+	w.logger.Warn(msg, attrs...)
+}
+
+func (w *Watcher) logRecovery(msg string, failures int) {
+	w.logger.Info(msg, slog.Int("previous_consecutive_failures", failures))
+}
+
+func (w *Watcher) reportHealthEvent(ctx context.Context, component, level, message string, cause error, failures int) {
+	if w.healthSink == nil {
+		return
+	}
+
+	now := time.Now().UTC()
+	raw := message
+	if cause != nil {
+		raw += ": " + cause.Error()
+	}
+	if failures > 0 {
+		raw += fmt.Sprintf("\nconsecutive_failures=%d", failures)
+	}
+
+	event := model.LogEvent{
+		Timestamp:    now,
+		Container:    model.ContainerInfo{Name: w.healthContainer},
+		Stream:       "system",
+		Level:        strings.TrimSpace(strings.ToUpper(level)),
+		LogID:        "monitor.health." + component,
+		AlertMatched: true,
+		Message:      message,
+		Raw:          raw,
+	}
+
+	batch := model.LogBatch{
+		LogID:      event.LogID,
+		FirstSeen:  now,
+		LastSeen:   now,
+		Count:      1,
+		Containers: []string{event.Container.Name},
+		Events:     []model.LogEvent{event},
+		FlushedAt:  now,
+	}
+
+	if err := w.healthSink.AppendBatch(ctx, batch); err != nil {
+		w.logger.Error("report watcher health event failed",
+			slog.String("component", component),
+			slog.String("level", event.Level),
+			slog.String("error", err.Error()),
+		)
 	}
 }
 

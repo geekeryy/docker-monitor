@@ -20,8 +20,17 @@ func TestFormatSincePreservesSubSecondPrecision(t *testing.T) {
 	t.Parallel()
 
 	ts := time.Date(2026, 3, 28, 12, 34, 56, 789123456, time.UTC)
-	if got := FormatSince(ts); got != "2026-03-28T12:34:56.789123456Z" {
-		t.Fatalf("FormatSince() = %q, want RFC3339Nano timestamp", got)
+	if got := FormatSince(ts); got != "1774701296" {
+		t.Fatalf("FormatSince() = %q, want unix timestamp in seconds", got)
+	}
+}
+
+func TestFormatSinceOmitsFractionWhenNoSubSecondPrecision(t *testing.T) {
+	t.Parallel()
+
+	ts := time.Date(2026, 3, 28, 12, 34, 56, 0, time.UTC)
+	if got := FormatSince(ts); got != "1774701296" {
+		t.Fatalf("FormatSince() = %q, want unix timestamp in seconds", got)
 	}
 }
 

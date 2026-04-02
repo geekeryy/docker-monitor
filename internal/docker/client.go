@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -279,7 +280,7 @@ func FormatSince(ts time.Time) string {
 	if ts.IsZero() {
 		return ""
 	}
-	return ts.UTC().Format(time.RFC3339Nano)
+	return strconv.FormatInt(ts.UTC().Unix(), 10)
 }
 
 func withRequestTimeout(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {

@@ -42,6 +42,8 @@
 - 每隔 `aggregation.flush_interval` 会把当前有告警的批次统一刷盘。
 - 如果一条告警日志没有提取到 `log_id`，会使用 `aggregation.unknown_log_id`，并单条立即输出，避免混淆。
 - 监控多个 Docker Host 时，容器名会自动加上主机前缀，例如 `coach_test/api`，方便区分来源。
+- 通过 `ssh://` 连接远程 Docker 时，程序会为 SSH 会话开启 keepalive，并在容器列表同步失败或 Docker 事件流断开后自动重试。
+- 当远程 Docker 连续失败达到阈值时，程序会额外生成 `monitor.health.*` 健康事件，用于本地落盘和钉钉通知；恢复后也会发送一条恢复事件。
 
 ## 项目结构
 
@@ -209,6 +211,14 @@ storage:
 - SSH：`ssh://user@prod-a`
 - SSH 指定远程 Docker Socket：`ssh://user@prod-a/var/run/docker.sock`
 
+#### SSH 连接行为
+
+- `ssh://` 模式底层使用本机 `ssh` 命令连接远程主机，再通过 Docker API 读取容器列表、事件流和日志流。
+- SSH 会话会带 keepalive 参数，默认使用 `ServerAliveInterval=30` 和 `ServerAliveCountMax=3`，减少长时间空闲连接被网络设备回收。
+- 如果远程主机短暂不可达、`dockerd` 重启、网络抖动导致事件流或同步失败，程序会持续重试，不需要人工重启。
+- 重连后会重新同步容器列表，并继续订阅 Docker 事件流。
+- 重连窗口内仍然可能出现少量重复日志；如果远端长时间不可达，则会持续重试并输出健康事件。
+
 ### `filters.warn_match`
 
 用于识别“这条日志是不是告警”。
@@ -294,6 +304,7 @@ filters:
 - 每个批次都会先发送一条 Markdown 摘要。
 - 只有批次内存在 `mention_levels` 指定的级别时，才会发送第二条文本消息用于 `@`。
 - 钉钉失败只会记日志警告，不会中断主流程，也不会影响文件落盘。
+- `monitor.health.*` 健康事件也会复用同一条钉钉发送链路；如果它的级别命中了 `mention_levels`，同样会触发 `@`。
 
 ### `storage`
 
@@ -305,6 +316,15 @@ filters:
 data/
 └── 2026-03/
     └── 2026-03-24.jsonl
+```
+
+健康事件会单独写到同目录下的 `.health.jsonl` 文件，例如：
+
+```text
+data/
+└── 2026-03/
+    ├── 2026-03-24.jsonl
+    └── 2026-03-24.health.jsonl
 ```
 
 ## 输出格式
@@ -363,6 +383,14 @@ data/
 
 如果开启 `@`，第二条文本消息会只负责提醒相关人员，不会把手机号直接混进 Markdown 正文。
 
+对于 `monitor.health.*` 健康事件，钉钉消息会切换成更偏系统告警的展示方式，重点展示：
+
+- 主机
+- 状态
+- 组件
+- 时间
+- 说明和错误详情
+
 ## 常见配置示例
 
 ### 只监听本机 `api-*` 容器
@@ -412,6 +440,13 @@ dingtalk:
 - 日志是否确实输出到容器的 `stdout` / `stderr`
 - `docker.since` 是否过小，导致启动时回看窗口不足
 
+如果你使用的是 `ssh://` 远程 Docker，还可以额外检查：
+
+- 当前机器到远程主机的 SSH 连通性是否稳定
+- 远程主机上的 Docker Engine 是否正常响应
+- 本地或中间网络设备是否存在较严格的空闲连接回收策略
+- 当天的 `.health.jsonl` 中是否已经出现 `monitor.health.docker.container_sync` 或 `monitor.health.docker.event_stream`
+
 ### 识别不到 `log_id`
 
 优先检查：
@@ -428,6 +463,7 @@ dingtalk:
 - 如果配置了 `secret`，机器人是否启用了加签
 - 运行环境是否可以访问钉钉接口
 - 该批次是否真的包含 `mention_levels` 指定的级别
+- 如果是健康事件，确认 `mention_levels` 是否包含 `ERROR`
 
 ## 镜像发布
 

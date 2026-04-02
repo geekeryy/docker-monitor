@@ -179,6 +179,10 @@ func buildDingTalkMarkdown(batch model.LogBatch, maxEvents int) string {
 }
 
 func buildDingTalkMarkdownWithLocation(batch model.LogBatch, maxEvents int, location *time.Location) string {
+	if isHealthBatch(batch) {
+		return buildHealthDingTalkMarkdown(batch, location)
+	}
+
 	var builder strings.Builder
 	builder.WriteString("### ")
 	builder.WriteString(buildDingTalkTitle(batch))
@@ -214,8 +218,27 @@ func buildDingTalkMarkdownWithLocation(batch model.LogBatch, maxEvents int, loca
 	return builder.String()
 }
 
-func formatDisplayTime(ts time.Time) string {
-	return formatDisplayTimeInLocation(ts, time.Local)
+func buildHealthDingTalkMarkdown(batch model.LogBatch, location *time.Location) string {
+	var builder strings.Builder
+	event := firstBatchEvent(batch)
+
+	builder.WriteString("### ")
+	builder.WriteString(buildDingTalkTitle(batch))
+	builder.WriteString("\n\n")
+	if hosts := extractDockerHosts(batch); len(hosts) > 0 {
+		builder.WriteString(fmt.Sprintf("- 主机: `%s`\n", strings.Join(hosts, ", ")))
+	}
+	builder.WriteString(fmt.Sprintf("- 状态: `%s`\n", emptyAsDash(event.Level)))
+	builder.WriteString(fmt.Sprintf("- 组件: `%s`\n", healthComponent(batch.LogID)))
+	builder.WriteString(fmt.Sprintf("- 时间: `%s`\n", formatDisplayTimeInLocation(event.Timestamp, location)))
+	builder.WriteString(fmt.Sprintf("- 容器: `%s`\n", strings.Join(batch.Containers, ", ")))
+	builder.WriteString("\n#### 说明\n\n")
+	builder.WriteString(strings.TrimSpace(event.Message))
+	builder.WriteString("\n\n#### 详情\n\n```\n")
+	builder.WriteString(detailedLog(event))
+	builder.WriteString("\n```\n")
+
+	return builder.String()
 }
 
 func formatDisplayTimeInLocation(ts time.Time, location *time.Location) string {
@@ -295,7 +318,11 @@ func renderMobileMentions(mobiles []string) string {
 }
 
 func buildDingTalkTitle(batch model.LogBatch) string {
-	title := "Docker日志告警 " + batch.LogID
+	titlePrefix := "Docker日志告警 "
+	if isHealthBatch(batch) {
+		titlePrefix = "Docker监控健康告警 "
+	}
+	title := titlePrefix + batch.LogID
 	if hosts := extractDockerHosts(batch); len(hosts) > 0 {
 		title += " [" + strings.Join(hosts, ",") + "]"
 	}
@@ -304,7 +331,21 @@ func buildDingTalkTitle(batch model.LogBatch) string {
 
 func buildDingTalkMentionText(batch model.LogBatch, atAll bool, atMobiles []string) string {
 	var builder strings.Builder
-	builder.WriteString(buildDingTalkTitle(batch))
+	if isHealthBatch(batch) {
+		builder.WriteString("Docker监控健康告警")
+		if hosts := extractDockerHosts(batch); len(hosts) > 0 {
+			builder.WriteString(" [")
+			builder.WriteString(strings.Join(hosts, ","))
+			builder.WriteString("]")
+		}
+		event := firstBatchEvent(batch)
+		if strings.TrimSpace(event.Message) != "" {
+			builder.WriteString(" ")
+			builder.WriteString(strings.TrimSpace(event.Message))
+		}
+	} else {
+		builder.WriteString(buildDingTalkTitle(batch))
+	}
 
 	if atAll {
 		builder.WriteString(" @all")
@@ -317,6 +358,21 @@ func buildDingTalkMentionText(batch model.LogBatch, atAll bool, atMobiles []stri
 		builder.WriteString(mentions)
 	}
 	return builder.String()
+}
+
+func isHealthBatch(batch model.LogBatch) bool {
+	return strings.HasPrefix(strings.TrimSpace(batch.LogID), "monitor.health.")
+}
+
+func healthComponent(logID string) string {
+	return strings.TrimPrefix(strings.TrimSpace(logID), "monitor.health.")
+}
+
+func firstBatchEvent(batch model.LogBatch) model.LogEvent {
+	if len(batch.Events) == 0 {
+		return model.LogEvent{}
+	}
+	return batch.Events[0]
 }
 
 func extractDockerHosts(batch model.LogBatch) []string {
