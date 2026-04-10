@@ -44,8 +44,16 @@ type ContainerSummary struct {
 }
 
 type ContainerJSON struct {
-	ID   string `json:"Id"`
-	Name string `json:"Name"`
+	ID    string         `json:"Id"`
+	Name  string         `json:"Name"`
+	State ContainerState `json:"State"`
+}
+
+type ContainerState struct {
+	Status     string `json:"Status"`
+	Running    bool   `json:"Running"`
+	Restarting bool   `json:"Restarting"`
+	ExitCode   int    `json:"ExitCode"`
 }
 
 type EventActor struct {

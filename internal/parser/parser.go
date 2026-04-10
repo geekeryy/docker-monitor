@@ -115,7 +115,8 @@ func (p *Parser) Parse(raw model.RawLog) (*model.LogEvent, bool, error) {
 	}
 
 	if hasAnyRegexp(event.Message, p.excludeRegexps) ||
-		hasAnyRegexp(line, p.excludeRegexps) {
+		hasAnyRegexp(line, p.excludeRegexps) ||
+		payloadHasAnyRegexp(parsedJSON, p.excludeRegexps) {
 		return nil, false, nil
 	}
 
@@ -249,6 +250,35 @@ func hasAnyRegexp(text string, regexps []*regexp.Regexp) bool {
 			return true
 		}
 	}
+	return false
+}
+
+func payloadHasAnyRegexp(value any, regexps []*regexp.Regexp) bool {
+	switch typed := value.(type) {
+	case map[string]any:
+		for _, item := range typed {
+			if payloadHasAnyRegexp(item, regexps) {
+				return true
+			}
+		}
+	case []any:
+		for _, item := range typed {
+			if payloadHasAnyRegexp(item, regexps) {
+				return true
+			}
+		}
+	case string:
+		return hasAnyRegexp(typed, regexps)
+	case nil:
+		return false
+	default:
+		text := strings.TrimSpace(fmt.Sprint(typed))
+		if text == "" {
+			return false
+		}
+		return hasAnyRegexp(text, regexps)
+	}
+
 	return false
 }
 

@@ -278,6 +278,37 @@ func TestParseSkipsJSONLogMatchedByExcludeRegexp(t *testing.T) {
 	}
 }
 
+func TestParseSkipsJSONLogMatchedByExcludeRegexpInNestedField(t *testing.T) {
+	t.Parallel()
+
+	p, err := New(config.FilterConfig{
+		WarnMatch: config.WarnMatchConfig{
+			Regexps:        []string{`(?i)\b(ERROR)\b`},
+			ExcludeRegexps: []string{`(?i)\bUnauthorized\b`},
+			JSONFields:     []string{"level"},
+		},
+		LogIDExtract: config.LogIDExtractConfig{
+			JSONKeys: []string{"log_id"},
+		},
+	}, "unknown")
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	_, ok, err := p.Parse(model.RawLog{
+		Timestamp: time.Unix(81, 0).UTC(),
+		Container: model.ContainerInfo{Name: "app-1"},
+		Stream:    "stdout",
+		Line:      `{"level":"ERROR","log_id":"err-1","error":{"message":"\u0055nauthorized"}}`,
+	})
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	if ok {
+		t.Fatalf("Parse() ok = true, want false")
+	}
+}
+
 func TestParseTimestampStringPreservesExplicitOffset(t *testing.T) {
 	t.Parallel()
 

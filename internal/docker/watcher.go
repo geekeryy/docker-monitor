@@ -351,10 +351,8 @@ func (w *Watcher) runStream(rootCtx, ctx context.Context, info model.ContainerIn
 				slog.String("container", info.Name),
 				slog.String("error", err.Error()),
 			)
-		} else {
-			w.logger.Warn("docker log stream ended unexpectedly, retrying",
-				slog.String("container", info.Name),
-			)
+		} else if !w.handleEndedLogStream(rootCtx, info) {
+			return
 		}
 
 		select {
@@ -363,6 +361,41 @@ func (w *Watcher) runStream(rootCtx, ctx context.Context, info model.ContainerIn
 		case <-time.After(w.reconnectDelay):
 		}
 	}
+}
+
+func (w *Watcher) handleEndedLogStream(ctx context.Context, info model.ContainerInfo) bool {
+	container, found, inspected := w.inspectContainer(ctx, info.ID)
+	if !inspected {
+		w.logger.Warn("docker log stream ended unexpectedly, retrying",
+			slog.String("container", info.Name),
+		)
+		return true
+	}
+
+	if !found {
+		w.logger.Info("docker log stream ended because container no longer exists",
+			slog.String("container", info.Name),
+			slog.String("container_id", info.ID),
+		)
+		return false
+	}
+
+	if container.State.Running {
+		w.logger.Warn("docker log stream ended while container is still running, retrying",
+			slog.String("container", info.Name),
+			slog.String("container_id", info.ID),
+			slog.String("container_status", strings.TrimSpace(container.State.Status)),
+		)
+		return true
+	}
+
+	w.logger.Info("docker log stream ended because container is no longer running",
+		slog.String("container", info.Name),
+		slog.String("container_id", info.ID),
+		slog.String("container_status", strings.TrimSpace(container.State.Status)),
+		slog.Int("exit_code", container.State.ExitCode),
+	)
+	return false
 }
 
 func (w *Watcher) stop(id string) {
@@ -476,6 +509,27 @@ func (w *Watcher) resolveContainerByName(ctx context.Context, name string) (mode
 	}
 
 	return model.ContainerInfo{}, false
+}
+
+func (w *Watcher) inspectContainer(ctx context.Context, id string) (ContainerJSON, bool, bool) {
+	inspector, ok := w.client.(ContainerInspector)
+	if !ok {
+		return ContainerJSON{}, false, false
+	}
+
+	container, err := inspector.ContainerInspect(ctx, id)
+	if err != nil {
+		if isContainerNotFound(err) {
+			return ContainerJSON{}, false, true
+		}
+		w.logger.Warn("inspect container after log stream ended failed",
+			slog.String("container_id", id),
+			slog.String("error", err.Error()),
+		)
+		return ContainerJSON{}, false, false
+	}
+
+	return container, true, true
 }
 
 func selectContainer(summary ContainerSummary, patterns []string) (model.ContainerInfo, bool) {

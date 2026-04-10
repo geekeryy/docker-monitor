@@ -12,7 +12,9 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/geekeryy/docker-monitor/internal/model"
 )
@@ -25,9 +27,20 @@ type DingTalkStore struct {
 	mentionLevels map[string]struct{}
 	maxEvents     int
 	client        *http.Client
+
+	mu               sync.Mutex
+	sendInterval     time.Duration
+	rateLimitBackoff time.Duration
+	nextSendAt       time.Time
+	blockedUntil     time.Time
 }
 
 const maxDingTalkResponseBytes = 1 << 20
+const maxDingTalkPayloadBytes = 20000
+const dingTalkPayloadTruncationNotice = "\n\n... (已截断)"
+const defaultDingTalkSendInterval = 4 * time.Second
+const defaultDingTalkRateLimitBackoff = time.Minute
+const dingTalkErrCodeRateLimit = 660026
 
 type dingTalkPayload struct {
 	MsgType  string               `json:"msgtype"`
@@ -56,6 +69,19 @@ type dingTalkResponse struct {
 }
 
 func NewDingTalkStore(webhookURL, secret string, atAll bool, atMobiles []string, mentionLevels []string, maxEvents int) *DingTalkStore {
+	return newDingTalkStoreWithTiming(
+		webhookURL,
+		secret,
+		atAll,
+		atMobiles,
+		mentionLevels,
+		maxEvents,
+		defaultDingTalkSendInterval,
+		defaultDingTalkRateLimitBackoff,
+	)
+}
+
+func newDingTalkStoreWithTiming(webhookURL, secret string, atAll bool, atMobiles []string, mentionLevels []string, maxEvents int, sendInterval, rateLimitBackoff time.Duration) *DingTalkStore {
 	if strings.TrimSpace(webhookURL) == "" {
 		return nil
 	}
@@ -72,6 +98,8 @@ func NewDingTalkStore(webhookURL, secret string, atAll bool, atMobiles []string,
 		client: &http.Client{
 			Timeout: 8 * time.Second,
 		},
+		sendInterval:     sendInterval,
+		rateLimitBackoff: rateLimitBackoff,
 	}
 }
 
@@ -118,9 +146,13 @@ func (s *DingTalkStore) AppendBatch(ctx context.Context, batch model.LogBatch) e
 }
 
 func (s *DingTalkStore) sendPayload(ctx context.Context, payload dingTalkPayload) error {
-	body, err := json.Marshal(payload)
+	if err := s.waitForSendWindow(ctx); err != nil {
+		return err
+	}
+
+	body, err := marshalDingTalkPayload(payload)
 	if err != nil {
-		return fmt.Errorf("marshal dingtalk payload: %w", err)
+		return err
 	}
 
 	reqURL, err := signedWebhookURL(s.webhookURL, s.secret)
@@ -148,10 +180,167 @@ func (s *DingTalkStore) sendPayload(ctx context.Context, payload dingTalkPayload
 		return fmt.Errorf("dingtalk http status %s: %s", resp.Status, result.ErrMsg)
 	}
 	if result.ErrCode != 0 {
+		if result.ErrCode == dingTalkErrCodeRateLimit {
+			s.noteRateLimit()
+			return fmt.Errorf("dingtalk send failed: %s (%d), local cooldown %s applied", result.ErrMsg, result.ErrCode, s.rateLimitBackoff)
+		}
 		return fmt.Errorf("dingtalk send failed: %s (%d)", result.ErrMsg, result.ErrCode)
 	}
 
 	return nil
+}
+
+func (s *DingTalkStore) waitForSendWindow(ctx context.Context) error {
+	if s == nil {
+		return nil
+	}
+
+	s.mu.Lock()
+	waitUntil := s.nextSendAt
+	if s.blockedUntil.After(waitUntil) {
+		waitUntil = s.blockedUntil
+	}
+
+	now := time.Now()
+	if waitUntil.Before(now) {
+		waitUntil = now
+	}
+	if s.sendInterval > 0 {
+		s.nextSendAt = waitUntil.Add(s.sendInterval)
+	} else {
+		s.nextSendAt = waitUntil
+	}
+	s.mu.Unlock()
+
+	delay := time.Until(waitUntil)
+	if delay <= 0 {
+		return nil
+	}
+
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func (s *DingTalkStore) noteRateLimit() {
+	if s == nil || s.rateLimitBackoff <= 0 {
+		return
+	}
+
+	blockedUntil := time.Now().Add(s.rateLimitBackoff)
+
+	s.mu.Lock()
+	if blockedUntil.After(s.blockedUntil) {
+		s.blockedUntil = blockedUntil
+	}
+	s.mu.Unlock()
+}
+
+func marshalDingTalkPayload(payload dingTalkPayload) ([]byte, error) {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("marshal dingtalk payload: %w", err)
+	}
+	if len(body) <= maxDingTalkPayloadBytes {
+		return body, nil
+	}
+
+	trimmedPayload, ok, err := truncateDingTalkPayload(payload)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, fmt.Errorf("dingtalk payload exceeds %d bytes", maxDingTalkPayloadBytes)
+	}
+
+	body, err = json.Marshal(trimmedPayload)
+	if err != nil {
+		return nil, fmt.Errorf("marshal truncated dingtalk payload: %w", err)
+	}
+	if len(body) > maxDingTalkPayloadBytes {
+		return nil, fmt.Errorf("dingtalk payload exceeds %d bytes after truncation", maxDingTalkPayloadBytes)
+	}
+	return body, nil
+}
+
+func truncateDingTalkPayload(payload dingTalkPayload) (dingTalkPayload, bool, error) {
+	switch payload.MsgType {
+	case "markdown":
+		text, ok, err := truncatePayloadString(payload.Markdown.Text, func(content string) dingTalkPayload {
+			trimmed := payload
+			trimmed.Markdown.Text = content
+			return trimmed
+		})
+		if err != nil || !ok {
+			return dingTalkPayload{}, ok, err
+		}
+		payload.Markdown.Text = text
+		return payload, true, nil
+	case "text":
+		text, ok, err := truncatePayloadString(payload.Text.Content, func(content string) dingTalkPayload {
+			trimmed := payload
+			trimmed.Text.Content = content
+			return trimmed
+		})
+		if err != nil || !ok {
+			return dingTalkPayload{}, ok, err
+		}
+		payload.Text.Content = text
+		return payload, true, nil
+	default:
+		return dingTalkPayload{}, false, nil
+	}
+}
+
+func truncatePayloadString(content string, build func(string) dingTalkPayload) (string, bool, error) {
+	candidate := strings.TrimRight(content, "\n")
+	best := dingTalkPayloadTruncationNotice
+
+	body, err := json.Marshal(build(best))
+	if err != nil {
+		return "", false, fmt.Errorf("marshal truncated dingtalk payload: %w", err)
+	}
+	if len(body) > maxDingTalkPayloadBytes {
+		return "", false, nil
+	}
+
+	low, high := 0, len(candidate)
+	for low <= high {
+		mid := (low + high) / 2
+		truncated := strings.TrimRight(truncateUTF8ByBytes(candidate, mid), "\n") + dingTalkPayloadTruncationNotice
+
+		body, err := json.Marshal(build(truncated))
+		if err != nil {
+			return "", false, fmt.Errorf("marshal truncated dingtalk payload: %w", err)
+		}
+		if len(body) <= maxDingTalkPayloadBytes {
+			best = truncated
+			low = mid + 1
+			continue
+		}
+		high = mid - 1
+	}
+
+	return best, true, nil
+}
+
+func truncateUTF8ByBytes(text string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	if len(text) <= limit {
+		return text
+	}
+	for limit > 0 && limit < len(text) && !utf8.RuneStart(text[limit]) {
+		limit--
+	}
+	return text[:limit]
 }
 
 func signedWebhookURL(rawURL, secret string) (string, error) {

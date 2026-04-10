@@ -245,6 +245,113 @@ func TestWatcherMaybeStartReplacesExistingStreamForSameName(t *testing.T) {
 	waitForContainerLogsCall(t, logsClient.calls, "container-b")
 }
 
+func TestWatcherRunStreamStopsRetryingWhenContainerHasStopped(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	logHandler := &recordingSlogHandler{}
+	logger := slog.New(logHandler)
+	logsClient := &sequenceLogsClient{
+		readers: map[string]func(context.Context) io.ReadCloser{
+			"container-a": func(context.Context) io.ReadCloser {
+				return io.NopCloser(strings.NewReader(""))
+			},
+		},
+		calls: make(chan string, 4),
+	}
+	discoveryClient := &staticDiscoveryClient{
+		inspect: map[string]ContainerJSON{
+			"container-a": {
+				ID:   "container-a",
+				Name: "/api",
+				State: ContainerState{
+					Status:   "exited",
+					Running:  false,
+					ExitCode: 137,
+				},
+			},
+		},
+	}
+	watcher := NewWatcher(
+		discoveryClient,
+		NewLogReader(logsClient),
+		[]string{"api"},
+		"",
+		time.Now(),
+		0,
+		func(context.Context, model.RawLog) error { return nil },
+		logger,
+	)
+	watcher.reconnectDelay = 20 * time.Millisecond
+
+	watcher.maybeStart(ctx, ContainerSummary{
+		ID:    "container-a",
+		Names: []string{"/api"},
+	})
+
+	waitForContainerLogsCall(t, logsClient.calls, "container-a")
+	waitForLogMessage(t, logHandler, slog.LevelInfo, "docker log stream ended because container is no longer running")
+
+	select {
+	case got := <-logsClient.calls:
+		t.Fatalf("unexpected retry ContainerLogs call for %q after container stopped", got)
+	case <-time.After(80 * time.Millisecond):
+	}
+}
+
+func TestWatcherRunStreamRetriesWhenContainerIsStillRunning(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	logHandler := &recordingSlogHandler{}
+	logger := slog.New(logHandler)
+	logsClient := &sequenceLogsClient{
+		readers: map[string]func(context.Context) io.ReadCloser{
+			"container-a": func(context.Context) io.ReadCloser {
+				return io.NopCloser(strings.NewReader(""))
+			},
+		},
+		calls: make(chan string, 8),
+	}
+	discoveryClient := &staticDiscoveryClient{
+		inspect: map[string]ContainerJSON{
+			"container-a": {
+				ID:   "container-a",
+				Name: "/api",
+				State: ContainerState{
+					Status:  "running",
+					Running: true,
+				},
+			},
+		},
+	}
+	watcher := NewWatcher(
+		discoveryClient,
+		NewLogReader(logsClient),
+		[]string{"api"},
+		"",
+		time.Now(),
+		0,
+		func(context.Context, model.RawLog) error { return nil },
+		logger,
+	)
+	watcher.reconnectDelay = 20 * time.Millisecond
+
+	watcher.maybeStart(ctx, ContainerSummary{
+		ID:    "container-a",
+		Names: []string{"/api"},
+	})
+
+	waitForContainerLogsCall(t, logsClient.calls, "container-a")
+	waitForLogMessage(t, logHandler, slog.LevelWarn, "docker log stream ended while container is still running, retrying")
+	waitForContainerLogsCall(t, logsClient.calls, "container-a")
+	cancel()
+}
+
 func TestWatcherRunReconnectsEventStream(t *testing.T) {
 	t.Parallel()
 
@@ -448,6 +555,8 @@ func (c *recordingLogsClient) ContainerLogs(_ context.Context, containerID strin
 
 type staticDiscoveryClient struct {
 	containers []ContainerSummary
+	inspect    map[string]ContainerJSON
+	inspectErr map[string]error
 }
 
 func (c *staticDiscoveryClient) ContainerList(_ context.Context, _ ContainerListOptions) ([]ContainerSummary, error) {
@@ -460,6 +569,16 @@ func (c *staticDiscoveryClient) Events(_ context.Context, _ EventsOptions) (<-ch
 	close(msgCh)
 	close(errCh)
 	return msgCh, errCh
+}
+
+func (c *staticDiscoveryClient) ContainerInspect(_ context.Context, containerID string) (ContainerJSON, error) {
+	if err := c.inspectErr[containerID]; err != nil {
+		return ContainerJSON{}, err
+	}
+	if container, ok := c.inspect[containerID]; ok {
+		return container, nil
+	}
+	return ContainerJSON{}, errors.New("docker api GET /containers/" + containerID + "/json returned 404: No such container")
 }
 
 type reconnectingDiscoveryClient struct {

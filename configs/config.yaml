@@ -9,7 +9,8 @@ filters:
   warn_match:
     regexps:
       - '(?i)\b(WARN|ERROR)\b'
-    exclude_regexps: []
+    exclude_regexps:
+      - '\b(?:106\.55\.202\.118|113\.96\.223\.69|125\.39\.132\.125|43\.139\.209\.119)\b'
     json_fields:
       - "level"
     message_fields:

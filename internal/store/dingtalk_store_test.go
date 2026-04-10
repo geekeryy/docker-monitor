@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -366,5 +367,182 @@ func TestDingTalkStoreAppendBatchHealthErrorMentionsConfiguredUsers(t *testing.T
 	}
 	if !strings.Contains(receivedPayloads[1].Text.Content, "@13800000000") {
 		t.Fatalf("text content = %q, want mention", receivedPayloads[1].Text.Content)
+	}
+}
+
+func TestDingTalkStoreAppendBatchTruncatesOversizedMarkdownPayload(t *testing.T) {
+	t.Parallel()
+
+	var (
+		requestSizes     []int
+		receivedPayloads []dingTalkPayload
+	)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("ReadAll() error = %v", err)
+		}
+		requestSizes = append(requestSizes, len(body))
+
+		var payload dingTalkPayload
+		if err := json.Unmarshal(body, &payload); err != nil {
+			t.Fatalf("Unmarshal() error = %v", err)
+		}
+		receivedPayloads = append(receivedPayloads, payload)
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"errcode":0,"errmsg":"ok"}`))
+	}))
+	defer server.Close()
+
+	store := NewDingTalkStore(server.URL, "", false, nil, []string{"ERROR"}, 5)
+	longLine := strings.Repeat("错误堆栈-", 4000)
+	err := store.AppendBatch(context.Background(), model.LogBatch{
+		LogID:      "oversized-1",
+		FirstSeen:  time.Date(2026, 4, 2, 12, 0, 0, 0, time.UTC),
+		LastSeen:   time.Date(2026, 4, 2, 12, 0, 0, 0, time.UTC),
+		Count:      1,
+		Containers: []string{"coach_test/api"},
+		Events: []model.LogEvent{
+			{
+				Timestamp: time.Date(2026, 4, 2, 12, 0, 0, 0, time.UTC),
+				Container: model.ContainerInfo{Name: "coach_test/api"},
+				Level:     "ERROR",
+				Message:   "request failed",
+				Raw:       longLine,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("AppendBatch() error = %v", err)
+	}
+
+	if got := len(requestSizes); got != 1 {
+		t.Fatalf("len(requestSizes) = %d, want 1", got)
+	}
+	if requestSizes[0] > maxDingTalkPayloadBytes {
+		t.Fatalf("markdown request size = %d, want <= %d", requestSizes[0], maxDingTalkPayloadBytes)
+	}
+
+	markdownPayload := receivedPayloads[0]
+	if !strings.Contains(markdownPayload.Markdown.Text, "... (已截断)") {
+		t.Fatalf("markdown text = %q, want truncation notice", markdownPayload.Markdown.Text)
+	}
+	if strings.Contains(markdownPayload.Markdown.Text, longLine) {
+		t.Fatalf("markdown text unexpectedly contains full oversized raw log")
+	}
+}
+
+func TestDingTalkStoreRateLimitsLocalSends(t *testing.T) {
+	t.Parallel()
+
+	var requestTimes []time.Time
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestTimes = append(requestTimes, time.Now())
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"errcode":0,"errmsg":"ok"}`))
+	}))
+	defer server.Close()
+
+	store := newDingTalkStoreWithTiming(server.URL, "", false, nil, []string{"ERROR"}, 5, 70*time.Millisecond, 0)
+
+	first := model.LogBatch{
+		LogID:      "rate-limit-1",
+		FirstSeen:  time.Date(2026, 4, 2, 12, 0, 0, 0, time.UTC),
+		LastSeen:   time.Date(2026, 4, 2, 12, 0, 0, 0, time.UTC),
+		Count:      1,
+		Containers: []string{"coach_test/api"},
+		Events: []model.LogEvent{{
+			Timestamp: time.Date(2026, 4, 2, 12, 0, 0, 0, time.UTC),
+			Container: model.ContainerInfo{Name: "coach_test/api"},
+			Level:     "WARN",
+			Message:   "first request",
+			Raw:       "first request",
+		}},
+	}
+	second := first
+	second.LogID = "rate-limit-2"
+	second.Events = []model.LogEvent{{
+		Timestamp: time.Date(2026, 4, 2, 12, 0, 1, 0, time.UTC),
+		Container: model.ContainerInfo{Name: "coach_test/api"},
+		Level:     "WARN",
+		Message:   "second request",
+		Raw:       "second request",
+	}}
+
+	if err := store.AppendBatch(context.Background(), first); err != nil {
+		t.Fatalf("first AppendBatch() error = %v", err)
+	}
+	if err := store.AppendBatch(context.Background(), second); err != nil {
+		t.Fatalf("second AppendBatch() error = %v", err)
+	}
+
+	if got := len(requestTimes); got != 2 {
+		t.Fatalf("len(requestTimes) = %d, want 2", got)
+	}
+	if delta := requestTimes[1].Sub(requestTimes[0]); delta < 45*time.Millisecond {
+		t.Fatalf("request spacing = %s, want at least %s", delta, 45*time.Millisecond)
+	}
+}
+
+func TestDingTalkStoreAppliesCooldownAfterRateLimitResponse(t *testing.T) {
+	t.Parallel()
+
+	var requestTimes []time.Time
+	requestCount := 0
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestTimes = append(requestTimes, time.Now())
+		w.Header().Set("Content-Type", "application/json")
+		if requestCount == 0 {
+			_, _ = w.Write([]byte(`{"errcode":660026,"errmsg":"sending too many messages per minute"}`))
+			requestCount++
+			return
+		}
+		requestCount++
+		_, _ = w.Write([]byte(`{"errcode":0,"errmsg":"ok"}`))
+	}))
+	defer server.Close()
+
+	store := newDingTalkStoreWithTiming(server.URL, "", false, nil, []string{"ERROR"}, 5, 0, 50*time.Millisecond)
+
+	batch := model.LogBatch{
+		LogID:      "cooldown-1",
+		FirstSeen:  time.Date(2026, 4, 2, 12, 0, 0, 0, time.UTC),
+		LastSeen:   time.Date(2026, 4, 2, 12, 0, 0, 0, time.UTC),
+		Count:      1,
+		Containers: []string{"coach_test/api"},
+		Events: []model.LogEvent{{
+			Timestamp: time.Date(2026, 4, 2, 12, 0, 0, 0, time.UTC),
+			Container: model.ContainerInfo{Name: "coach_test/api"},
+			Level:     "WARN",
+			Message:   "first request",
+			Raw:       "first request",
+		}},
+	}
+
+	err := store.AppendBatch(context.Background(), batch)
+	if err == nil {
+		t.Fatal("first AppendBatch() error = nil, want rate limit error")
+	}
+	if !strings.Contains(err.Error(), "660026") {
+		t.Fatalf("first AppendBatch() error = %v, want rate limit code", err)
+	}
+	if !strings.Contains(err.Error(), "local cooldown") {
+		t.Fatalf("first AppendBatch() error = %v, want cooldown hint", err)
+	}
+
+	batch.LogID = "cooldown-2"
+	if err := store.AppendBatch(context.Background(), batch); err != nil {
+		t.Fatalf("second AppendBatch() error = %v", err)
+	}
+
+	if got := len(requestTimes); got != 2 {
+		t.Fatalf("len(requestTimes) = %d, want 2", got)
+	}
+	if delta := requestTimes[1].Sub(requestTimes[0]); delta < 30*time.Millisecond {
+		t.Fatalf("request spacing after rate limit = %s, want at least %s", delta, 30*time.Millisecond)
 	}
 }
