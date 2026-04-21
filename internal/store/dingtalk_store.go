@@ -28,6 +28,10 @@ type DingTalkStore struct {
 	maxEvents     int
 	client        *http.Client
 
+	// sendMu 把 waitForSendWindow 序列化，保证多并发调用之间的
+	// "下次允许发送时间"语义不会互相覆盖。它独立于 mu：mu 只保护
+	// nextSendAt / blockedUntil 等小字段，sendMu 则覆盖整个等待 + 推进流程。
+	sendMu           sync.Mutex
 	mu               sync.Mutex
 	sendInterval     time.Duration
 	rateLimitBackoff time.Duration
@@ -198,37 +202,36 @@ func (s *DingTalkStore) waitForSendWindow(ctx context.Context) error {
 		return nil
 	}
 
+	// sendMu 串行所有发送线程，确保 sendInterval 是一个真正排队的窗口；
+	// 同时也避免"两个调用都看到 nextSendAt 已过期 -> 同时发送"的竞争。
+	s.sendMu.Lock()
+	defer s.sendMu.Unlock()
+
 	s.mu.Lock()
 	waitUntil := s.nextSendAt
 	if s.blockedUntil.After(waitUntil) {
 		waitUntil = s.blockedUntil
 	}
-
-	now := time.Now()
-	if waitUntil.Before(now) {
-		waitUntil = now
-	}
-	if s.sendInterval > 0 {
-		s.nextSendAt = waitUntil.Add(s.sendInterval)
-	} else {
-		s.nextSendAt = waitUntil
-	}
 	s.mu.Unlock()
 
-	delay := time.Until(waitUntil)
-	if delay <= 0 {
-		return nil
+	if delay := time.Until(waitUntil); delay > 0 {
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			// 等待被取消，没有真正发送，nextSendAt 不推进，
+			// 让下一次调用能立即占用这个窗口。
+			return ctx.Err()
+		case <-timer.C:
+		}
 	}
 
-	timer := time.NewTimer(delay)
-	defer timer.Stop()
-
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
+	if s.sendInterval > 0 {
+		s.mu.Lock()
+		s.nextSendAt = time.Now().Add(s.sendInterval)
+		s.mu.Unlock()
 	}
+	return nil
 }
 
 func (s *DingTalkStore) noteRateLimit() {

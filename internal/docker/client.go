@@ -20,6 +20,21 @@ type Client struct {
 	httpClient *http.Client
 }
 
+// APIError 表示 docker daemon 返回的非 2xx 响应。
+// 业务代码应优先用 errors.As 解出 *APIError 后再判断 StatusCode，
+// 避免依赖 Error() 文本格式。
+type APIError struct {
+	Method     string
+	Path       string
+	Status     string
+	StatusCode int
+	Body       string
+}
+
+func (e *APIError) Error() string {
+	return fmt.Sprintf("docker api %s %s returned %s: %s", e.Method, e.Path, e.Status, e.Body)
+}
+
 type ContainerListOptions struct {
 	All bool
 }
@@ -278,8 +293,17 @@ func (c *Client) do(ctx context.Context, method, path string, query url.Values) 
 	}
 	if resp.StatusCode >= 300 {
 		defer resp.Body.Close()
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, fmt.Errorf("docker api %s %s returned %s: %s", method, path, resp.Status, strings.TrimSpace(string(body)))
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		if readErr != nil {
+			body = nil
+		}
+		return nil, &APIError{
+			Method:     method,
+			Path:       path,
+			Status:     resp.Status,
+			StatusCode: resp.StatusCode,
+			Body:       strings.TrimSpace(string(body)),
+		}
 	}
 	return resp, nil
 }

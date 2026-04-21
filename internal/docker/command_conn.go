@@ -3,6 +3,7 @@ package docker
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -53,7 +54,7 @@ type commandConn struct {
 
 func (c *commandConn) Read(p []byte) (int, error) {
 	n, err := c.stdout.Read(p)
-	if err == io.EOF {
+	if errors.Is(err, io.EOF) {
 		return n, c.handleEOF(err)
 	}
 	return n, err
@@ -61,7 +62,7 @@ func (c *commandConn) Read(p []byte) (int, error) {
 
 func (c *commandConn) Write(p []byte) (int, error) {
 	n, err := c.stdin.Write(p)
-	if err == io.EOF {
+	if errors.Is(err, io.EOF) {
 		return n, c.handleEOF(err)
 	}
 	return n, err
@@ -90,9 +91,11 @@ func (c *commandConn) SetReadDeadline(time.Time) error  { return nil }
 func (c *commandConn) SetWriteDeadline(time.Time) error { return nil }
 
 func (c *commandConn) handleEOF(err error) error {
-	if err != io.EOF {
+	if !errors.Is(err, io.EOF) {
 		return err
 	}
+	// 必须先等子进程退出，os/exec 内部那个负责把 stderr pipe 拷进
+	// c.stderr 的 goroutine 才算结束；之后再读 c.stderr 才是安全的。
 	waitErr := c.wait()
 	if waitErr == nil {
 		return err

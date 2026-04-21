@@ -4,6 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -61,6 +66,32 @@ func TestCopyDockerLogsRejectsOversizedMuxFrame(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "docker log frame exceeds") {
 		t.Fatalf("copyDockerLogs() error = %v, want frame limit error", err)
+	}
+}
+
+func TestIsClosedPipeMatchesStandardLibrarySentinels(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "io.ErrClosedPipe", err: io.ErrClosedPipe, want: true},
+		{name: "os.ErrClosed", err: os.ErrClosed, want: true},
+		{name: "fs.ErrClosed", err: fs.ErrClosed, want: true},
+		{name: "wrapped fs.ErrClosed", err: fmt.Errorf("read pipe: %w", fs.ErrClosed), want: true},
+		{name: "unrelated error", err: errors.New("connection reset"), want: false},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := isClosedPipe(tt.err); got != tt.want {
+				t.Fatalf("isClosedPipe(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
 	}
 }
 

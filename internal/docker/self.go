@@ -2,6 +2,8 @@ package docker
 
 import (
 	"context"
+	"errors"
+	"net/http"
 	"os"
 	"regexp"
 	"strings"
@@ -83,6 +85,13 @@ func isContainerNotFound(err error) bool {
 		return false
 	}
 
+	var apiErr *APIError
+	if errors.As(err, &apiErr) {
+		return apiErr.StatusCode == http.StatusNotFound
+	}
+	// 兼容旧测试 / 非真实 docker daemon 走过来的错误：当错误链里
+	// 没有结构化的 APIError 时退回到文本匹配，避免误判为容器仍存在
+	// 而陷入死循环重试。
 	message := err.Error()
-	return strings.Contains(message, " returned 404 ") || strings.Contains(message, "No such container")
+	return strings.Contains(message, "No such container")
 }

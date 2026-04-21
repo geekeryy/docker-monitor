@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -192,7 +194,9 @@ func splitDockerTimestamp(line string) (time.Time, string) {
 }
 
 func isClosedPipe(err error) bool {
-	return errors.Is(err, io.ErrClosedPipe) || strings.Contains(err.Error(), "file already closed")
+	return errors.Is(err, io.ErrClosedPipe) ||
+		errors.Is(err, fs.ErrClosed) ||
+		errors.Is(err, os.ErrClosed)
 }
 
 func copyDockerLogs(src io.Reader, stdoutWriter, stderrWriter io.Writer) error {

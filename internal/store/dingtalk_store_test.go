@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -544,6 +545,73 @@ func TestDingTalkStoreAppliesCooldownAfterRateLimitResponse(t *testing.T) {
 	}
 	if delta := requestTimes[1].Sub(requestTimes[0]); delta < 30*time.Millisecond {
 		t.Fatalf("request spacing after rate limit = %s, want at least %s", delta, 30*time.Millisecond)
+	}
+}
+
+func TestDingTalkStoreCancelledContextDoesNotConsumeSendWindow(t *testing.T) {
+	t.Parallel()
+
+	var requests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"errcode":0,"errmsg":"ok"}`))
+	}))
+	defer server.Close()
+
+	// 5s 间隔足够长：第二次调用一定会落入 timer 等待分支，
+	// 测试本身能在毫秒级结束（cancelled ctx 立即触发 select）。
+	store := newDingTalkStoreWithTiming(server.URL, "", false, nil, []string{"ERROR"}, 5, 5*time.Second, 0)
+
+	first := model.LogBatch{
+		LogID:      "ctx-cancel-1",
+		FirstSeen:  time.Date(2026, 4, 17, 9, 0, 0, 0, time.UTC),
+		LastSeen:   time.Date(2026, 4, 17, 9, 0, 0, 0, time.UTC),
+		Count:      1,
+		Containers: []string{"coach_test/api"},
+		Events: []model.LogEvent{{
+			Timestamp: time.Date(2026, 4, 17, 9, 0, 0, 0, time.UTC),
+			Container: model.ContainerInfo{Name: "coach_test/api"},
+			Level:     "WARN",
+			Message:   "first request",
+			Raw:       "first request",
+		}},
+	}
+
+	if err := store.AppendBatch(context.Background(), first); err != nil {
+		t.Fatalf("first AppendBatch() error = %v", err)
+	}
+	if requests != 1 {
+		t.Fatalf("requests after first send = %d, want 1", requests)
+	}
+
+	store.mu.Lock()
+	nextAfterFirst := store.nextSendAt
+	store.mu.Unlock()
+
+	cancelCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	second := first
+	second.LogID = "ctx-cancel-2"
+	err := store.AppendBatch(cancelCtx, second)
+	if err == nil {
+		t.Fatal("second AppendBatch() error = nil, want context.Canceled")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("second AppendBatch() error = %v, want context.Canceled", err)
+	}
+	if requests != 1 {
+		t.Fatalf("requests after cancelled wait = %d, want 1 (no extra HTTP call)", requests)
+	}
+
+	store.mu.Lock()
+	nextAfterCanceled := store.nextSendAt
+	store.mu.Unlock()
+
+	if !nextAfterCanceled.Equal(nextAfterFirst) {
+		t.Fatalf("nextSendAt advanced from %s to %s after cancelled wait, want unchanged",
+			nextAfterFirst, nextAfterCanceled)
 	}
 }
 

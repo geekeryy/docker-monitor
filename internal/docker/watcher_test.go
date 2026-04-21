@@ -258,6 +258,106 @@ func TestWatcherMaybeStartReplacesExistingStreamForSameName(t *testing.T) {
 	waitForContainerLogsCall(t, logsClient.calls, "container-b")
 }
 
+func TestWatcherHandleEventStartsRenamedContainerWhenNewNameMatches(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	logsClient := &sequenceLogsClient{
+		readers: map[string]func(context.Context) io.ReadCloser{
+			"container-rename": func(ctx context.Context) io.ReadCloser {
+				return &contextBoundReadCloser{ctx: ctx}
+			},
+		},
+		calls: make(chan string, 1),
+	}
+	watcher := NewWatcher(
+		&staticDiscoveryClient{},
+		NewLogReader(logsClient),
+		[]string{"api-*"},
+		"",
+		time.Now(),
+		0,
+		func(context.Context, model.RawLog) error { return nil },
+		slog.Default(),
+	)
+
+	// docker rename: 新名字 api-1 命中 patterns，应启动监听。
+	watcher.handleEvent(ctx, EventMessage{
+		ID:     "container-rename",
+		Action: "rename",
+		Actor: EventActor{
+			Attributes: map[string]string{"name": "api-1"},
+		},
+	})
+
+	waitForContainerLogsCall(t, logsClient.calls, "container-rename")
+}
+
+func TestWatcherActivateMigratesStreamWhenContainerRenamed(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	logsClient := &sequenceLogsClient{
+		readers: map[string]func(context.Context) io.ReadCloser{
+			"container-id": func(ctx context.Context) io.ReadCloser {
+				return &contextBoundReadCloser{ctx: ctx}
+			},
+		},
+		calls: make(chan string, 4),
+	}
+	watcher := NewWatcher(
+		&staticDiscoveryClient{},
+		NewLogReader(logsClient),
+		[]string{"api-*"},
+		"",
+		time.Now(),
+		0,
+		func(context.Context, model.RawLog) error { return nil },
+		slog.Default(),
+	)
+
+	watcher.maybeStart(ctx, ContainerSummary{
+		ID:    "container-id",
+		Names: []string{"/api-old"},
+	})
+	waitForContainerLogsCall(t, logsClient.calls, "container-id")
+
+	watcher.handleEvent(ctx, EventMessage{
+		ID:     "container-id",
+		Action: "rename",
+		Actor: EventActor{
+			Attributes: map[string]string{"name": "api-new"},
+		},
+	})
+
+	// rename 后必须重新触发一次 ContainerLogs（旧 stream 被取消、新 stream 启动），
+	// 同时 active map 中只剩一条新 name 记录，避免双流。
+	waitForContainerLogsCall(t, logsClient.calls, "container-id")
+
+	watcher.mu.Lock()
+	if _, exists := watcher.active["api-old"]; exists {
+		watcher.mu.Unlock()
+		t.Fatal("active map still references old name 'api-old' after rename")
+	}
+	current, exists := watcher.active["api-new"]
+	if !exists {
+		watcher.mu.Unlock()
+		t.Fatal("active map does not have entry for new name 'api-new' after rename")
+	}
+	if current.id != "container-id" {
+		t.Fatalf("active['api-new'].id = %q, want %q", current.id, "container-id")
+	}
+	if got := watcher.ids["container-id"]; got != "api-new" {
+		watcher.mu.Unlock()
+		t.Fatalf("ids[container-id] = %q, want %q", got, "api-new")
+	}
+	watcher.mu.Unlock()
+}
+
 func TestWatcherRunStreamStopsRetryingWhenContainerHasStopped(t *testing.T) {
 	t.Parallel()
 

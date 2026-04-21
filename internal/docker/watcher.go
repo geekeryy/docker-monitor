@@ -393,7 +393,11 @@ func (w *Watcher) handleEvent(ctx context.Context, msg EventMessage) {
 	}
 
 	switch msg.Action {
-	case "start", "restart", "unpause":
+	case "start", "restart", "unpause", "rename":
+		// rename 事件中 Actor.Attributes["name"] 是新名字。如果新名字
+		// 命中 includePatterns，需要触发 maybeStart：要么是"改名进入
+		// 监控范围"（之前没在监听），要么是已有 stream 但旧 key 已不再有效，
+		// 由 activate 内部处理同 ID 不同 name 的迁移。
 		w.maybeStart(ctx, ContainerSummary{
 			ID:    containerID,
 			Names: []string{name},
@@ -743,21 +747,29 @@ func (w *Watcher) activate(ctx context.Context, info model.ContainerInfo) (conte
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	var cancelPrevious context.CancelFunc
+
 	if current, exists := w.active[info.Name]; exists {
 		if current.id == info.ID {
 			return nil, false, nil
 		}
+		// 同名不同 ID：旧容器要被替换。
 		delete(w.ids, current.id)
-		streamCtx, cancel := context.WithCancel(ctx)
-		w.active[info.Name] = activeStream{id: info.ID, cancel: cancel}
-		w.ids[info.ID] = info.Name
-		return streamCtx, true, current.cancel
+		cancelPrevious = current.cancel
+	} else if previousName, ok := w.ids[info.ID]; ok && previousName != info.Name {
+		// 同 ID 不同名（典型场景：docker rename）。把旧 name 槽位
+		// 的 stream 取消并清理，避免新旧并存导致的双重读取。
+		if previous, exists := w.active[previousName]; exists && previous.id == info.ID {
+			delete(w.active, previousName)
+			cancelPrevious = previous.cancel
+		}
+		delete(w.ids, info.ID)
 	}
 
 	streamCtx, cancel := context.WithCancel(ctx)
 	w.active[info.Name] = activeStream{id: info.ID, cancel: cancel}
 	w.ids[info.ID] = info.Name
-	return streamCtx, true, nil
+	return streamCtx, true, cancelPrevious
 }
 
 func (w *Watcher) removeActive(name, id string) {
