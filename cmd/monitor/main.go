@@ -140,6 +140,14 @@ func newMonitorInstances(ctx context.Context, hostConfigs []config.ResolvedHostC
 		if err != nil {
 			return nil, err
 		}
+		backfillThreshold, err := cfg.BackfillThresholdDuration()
+		if err != nil {
+			return nil, err
+		}
+		backfillMaxDuration, err := cfg.BackfillMaxDurationDuration()
+		if err != nil {
+			return nil, err
+		}
 
 		client, err := newDockerClient(hostConfig.Host)
 		if err != nil {
@@ -206,6 +214,14 @@ func newMonitorInstances(ctx context.Context, hostConfigs []config.ResolvedHostC
 		}, instanceLogger)
 		watcher.SetHealthSink(outputStore)
 		watcher.SetHealthContainerName(label + "/monitor")
+		watcher.SetBackfillController(logAggregator)
+		watcher.SetBackfillThresholds(backfillThreshold, backfillMaxDuration)
+		if backfillThreshold > 0 {
+			instanceLogger.Info("docker log backfill suppression enabled",
+				slog.Duration("backfill_threshold", backfillThreshold),
+				slog.Duration("backfill_max_duration", backfillMaxDuration),
+			)
+		}
 
 		instances = append(instances, monitorInstance{
 			label:       label,

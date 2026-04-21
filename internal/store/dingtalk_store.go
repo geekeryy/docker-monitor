@@ -107,6 +107,9 @@ func (s *DingTalkStore) AppendBatch(ctx context.Context, batch model.LogBatch) e
 	if s == nil {
 		return nil
 	}
+	if batch.SuppressAlertSinks {
+		return nil
+	}
 
 	shouldMention := batchHasAnyLevel(batch, s.mentionLevels)
 	atMobiles := mentionedMobiles(s.atMobiles, shouldMention)

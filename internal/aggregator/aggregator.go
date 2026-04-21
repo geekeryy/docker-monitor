@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/geekeryy/docker-monitor/internal/model"
@@ -23,6 +24,9 @@ type Aggregator struct {
 
 	mu     sync.Mutex
 	groups map[string]*groupBuffer
+
+	activeBackfills atomic.Int32
+	backfillAlerts  atomic.Int64
 }
 
 type groupBuffer struct {
@@ -63,14 +67,22 @@ func (a *Aggregator) Run(ctx context.Context) error {
 }
 
 func (a *Aggregator) Add(ctx context.Context, event model.LogEvent) error {
+	suppress := a.activeBackfills.Load() > 0
+	if suppress && event.AlertMatched {
+		a.backfillAlerts.Add(1)
+	}
+
 	if a.shouldFlushIndividually(event) {
-		return a.store.AppendBatch(ctx, batchFromSingleEvent(event))
+		batch := batchFromSingleEvent(event)
+		batch.SuppressAlertSinks = suppress
+		return a.store.AppendBatch(ctx, batch)
 	}
 
 	batch, shouldFlush := a.add(event)
 	if !shouldFlush {
 		return nil
 	}
+	batch.SuppressAlertSinks = suppress
 	return a.store.AppendBatch(ctx, batch)
 }
 
@@ -80,13 +92,51 @@ func (a *Aggregator) shouldFlushIndividually(event model.LogEvent) bool {
 
 func (a *Aggregator) FlushAll(ctx context.Context) error {
 	batches := a.drainAll()
+	suppress := a.activeBackfills.Load() > 0
 	var errs []error
 	for _, batch := range batches {
+		if suppress {
+			batch.SuppressAlertSinks = true
+		}
 		if err := a.store.AppendBatch(ctx, batch); err != nil {
 			errs = append(errs, err)
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// EnterBackfill marks the aggregator as currently absorbing replayed historical
+// events for at least one stream. The first concurrent caller resets the alert
+// counter so the snapshot returned by ExitBackfill is scoped to the current
+// disconnect window. Calls are reference-counted so multiple streams entering
+// the backfill window concurrently are tracked correctly.
+func (a *Aggregator) EnterBackfill() {
+	if a.activeBackfills.Add(1) == 1 {
+		a.backfillAlerts.Store(0)
+	}
+}
+
+// ExitBackfill releases one outstanding backfill registration. When the last
+// stream exits, the cumulative alert count observed during the window is
+// returned and the counter is reset.
+func (a *Aggregator) ExitBackfill() int64 {
+	remaining := a.activeBackfills.Add(-1)
+	if remaining < 0 {
+		a.activeBackfills.Store(0)
+		return 0
+	}
+	if remaining == 0 {
+		count := a.backfillAlerts.Load()
+		a.backfillAlerts.Store(0)
+		return count
+	}
+	return 0
+}
+
+// IsBackfilling reports whether at least one stream is currently in backfill.
+// Mostly useful for diagnostics and tests.
+func (a *Aggregator) IsBackfilling() bool {
+	return a.activeBackfills.Load() > 0
 }
 
 func (a *Aggregator) add(event model.LogEvent) (model.LogBatch, bool) {

@@ -55,9 +55,11 @@ type LogIDExtractOverrideConfig struct {
 }
 
 type AggregationOverrideConfig struct {
-	FlushSize     *int    `yaml:"flush_size"`
-	FlushInterval *string `yaml:"flush_interval"`
-	UnknownLogID  *string `yaml:"unknown_log_id"`
+	FlushSize           *int    `yaml:"flush_size"`
+	FlushInterval       *string `yaml:"flush_interval"`
+	UnknownLogID        *string `yaml:"unknown_log_id"`
+	BackfillThreshold   *string `yaml:"backfill_threshold"`
+	BackfillMaxDuration *string `yaml:"backfill_max_duration"`
 }
 
 type DingTalkOverrideConfig struct {
@@ -175,6 +177,16 @@ type AggregationConfig struct {
 	FlushSize     int    `yaml:"flush_size"`
 	FlushInterval string `yaml:"flush_interval"`
 	UnknownLogID  string `yaml:"unknown_log_id"`
+	// BackfillThreshold controls the minimum disconnect duration that triggers
+	// the watcher's backfill mode. While in backfill, replayed historical
+	// alerts are persisted to disk but are NOT forwarded to alert sinks
+	// (e.g. DingTalk) to avoid drowning operators in stale notifications.
+	// A zero or empty value disables the feature.
+	BackfillThreshold string `yaml:"backfill_threshold"`
+	// BackfillMaxDuration is the safety upper bound for a single backfill
+	// window. When exceeded, the watcher force-exits backfill and emits the
+	// summary even if the log stream has not caught up to wall-clock time.
+	BackfillMaxDuration string `yaml:"backfill_max_duration"`
 }
 
 type DingTalkConfig struct {
@@ -231,9 +243,11 @@ func defaultConfig() Config {
 			},
 		},
 		Aggregation: AggregationConfig{
-			FlushSize:     20,
-			FlushInterval: "10s",
-			UnknownLogID:  "unknown",
+			FlushSize:           20,
+			FlushInterval:       "10s",
+			UnknownLogID:        "unknown",
+			BackfillThreshold:   "5m",
+			BackfillMaxDuration: "30m",
 		},
 		DingTalk: DingTalkConfig{
 			AtMobiles:     []string{},
@@ -265,6 +279,12 @@ func (c Config) validateResolved() error {
 		return err
 	}
 	if _, err := c.FlushIntervalDuration(); err != nil {
+		return err
+	}
+	if _, err := c.BackfillThresholdDuration(); err != nil {
+		return err
+	}
+	if _, err := c.BackfillMaxDurationDuration(); err != nil {
 		return err
 	}
 	if c.Aggregation.UnknownLogID == "" {
@@ -313,6 +333,40 @@ func (c Config) FlushIntervalDuration() (time.Duration, error) {
 	d, err := time.ParseDuration(c.Aggregation.FlushInterval)
 	if err != nil {
 		return 0, fmt.Errorf("parse aggregation.flush_interval: %w", err)
+	}
+	return d, nil
+}
+
+// BackfillThresholdDuration parses aggregation.backfill_threshold. An empty
+// string disables the feature and returns 0.
+func (c Config) BackfillThresholdDuration() (time.Duration, error) {
+	value := strings.TrimSpace(c.Aggregation.BackfillThreshold)
+	if value == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(value)
+	if err != nil {
+		return 0, fmt.Errorf("parse aggregation.backfill_threshold: %w", err)
+	}
+	if d < 0 {
+		return 0, fmt.Errorf("aggregation.backfill_threshold must be >= 0")
+	}
+	return d, nil
+}
+
+// BackfillMaxDurationDuration parses aggregation.backfill_max_duration. An
+// empty string falls back to a sane default at the call site (handled there).
+func (c Config) BackfillMaxDurationDuration() (time.Duration, error) {
+	value := strings.TrimSpace(c.Aggregation.BackfillMaxDuration)
+	if value == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(value)
+	if err != nil {
+		return 0, fmt.Errorf("parse aggregation.backfill_max_duration: %w", err)
+	}
+	if d < 0 {
+		return 0, fmt.Errorf("aggregation.backfill_max_duration must be >= 0")
 	}
 	return d, nil
 }
@@ -453,6 +507,12 @@ func applyAggregationOverrides(dst *AggregationConfig, override *AggregationOver
 	}
 	if override.UnknownLogID != nil {
 		dst.UnknownLogID = *override.UnknownLogID
+	}
+	if override.BackfillThreshold != nil {
+		dst.BackfillThreshold = *override.BackfillThreshold
+	}
+	if override.BackfillMaxDuration != nil {
+		dst.BackfillMaxDuration = *override.BackfillMaxDuration
 	}
 }
 

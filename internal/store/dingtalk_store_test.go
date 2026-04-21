@@ -546,3 +546,40 @@ func TestDingTalkStoreAppliesCooldownAfterRateLimitResponse(t *testing.T) {
 		t.Fatalf("request spacing after rate limit = %s, want at least %s", delta, 30*time.Millisecond)
 	}
 }
+
+func TestDingTalkStoreSkipsBatchWhenSuppressAlertSinks(t *testing.T) {
+	t.Parallel()
+
+	var requests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests++
+		_, _ = w.Write([]byte(`{"errcode":0,"errmsg":"ok"}`))
+	}))
+	defer server.Close()
+
+	store := NewDingTalkStore(server.URL, "", false, nil, []string{"WARN", "ERROR"}, 5)
+
+	batch := model.LogBatch{
+		LogID:              "suppress-1",
+		FirstSeen:          time.Date(2026, 4, 17, 9, 0, 0, 0, time.UTC),
+		LastSeen:           time.Date(2026, 4, 17, 9, 1, 0, 0, time.UTC),
+		Count:              1,
+		Containers:         []string{"coach_prod/api"},
+		SuppressAlertSinks: true,
+		Events: []model.LogEvent{{
+			Timestamp:    time.Date(2026, 4, 17, 9, 0, 0, 0, time.UTC),
+			Container:    model.ContainerInfo{Name: "coach_prod/api"},
+			Level:        "WARN",
+			Message:      "replayed historical alert",
+			Raw:          "replayed historical alert",
+			AlertMatched: true,
+		}},
+	}
+
+	if err := store.AppendBatch(context.Background(), batch); err != nil {
+		t.Fatalf("AppendBatch() error = %v", err)
+	}
+	if requests != 0 {
+		t.Fatalf("dingtalk received %d requests, want 0 because batch was marked SuppressAlertSinks", requests)
+	}
+}

@@ -27,11 +27,12 @@ type LogEvent struct {
 }
 
 type LogBatch struct {
-	LogID      string     `json:"log_id"`
-	FirstSeen  time.Time  `json:"first_seen"`
-	LastSeen   time.Time  `json:"last_seen"`
-	Count      int        `json:"count"`
-	Containers []string   `json:"containers"`
-	Events     []LogEvent `json:"events"`
-	FlushedAt  time.Time  `json:"flushed_at"`
+	LogID              string     `json:"log_id"`
+	FirstSeen          time.Time  `json:"first_seen"`
+	LastSeen           time.Time  `json:"last_seen"`
+	Count              int        `json:"count"`
+	Containers         []string   `json:"containers"`
+	Events             []LogEvent `json:"events"`
+	FlushedAt          time.Time  `json:"flushed_at"`
+	SuppressAlertSinks bool       `json:"suppress_alert_sinks,omitempty"`
 }
