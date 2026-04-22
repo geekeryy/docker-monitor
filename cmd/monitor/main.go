@@ -67,18 +67,21 @@ func run() error {
 
 	for _, instance := range instances {
 		instance := instance
-		wg.Add(2)
 
-		go func() {
-			defer wg.Done()
-			if err := instance.aggregator.Run(ctx); err != nil {
-				errCh <- fmt.Errorf("docker host %s aggregator stopped: %w", instance.label, err)
-				if ctx.Err() == nil {
-					stop()
+		if instance.aggregator != nil {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if err := instance.aggregator.Run(ctx); err != nil {
+					errCh <- fmt.Errorf("docker host %s aggregator stopped: %w", instance.label, err)
+					if ctx.Err() == nil {
+						stop()
+					}
 				}
-			}
-		}()
+			}()
+		}
 
+		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			if err := instance.watcher.Run(ctx); err != nil {
@@ -99,11 +102,17 @@ func run() error {
 	wg.Wait()
 	var shutdownErrs []error
 	for _, instance := range instances {
+		if instance.aggregator == nil {
+			continue
+		}
 		if err := instance.aggregator.FlushAll(context.Background()); err != nil {
 			shutdownErrs = append(shutdownErrs, fmt.Errorf("docker host %s final flush failed: %w", instance.label, err))
 		}
 	}
 	for _, instance := range instances {
+		if instance.outputStore == nil {
+			continue
+		}
 		if err := instance.outputStore.Close(); err != nil {
 			shutdownErrs = append(shutdownErrs, fmt.Errorf("docker host %s store shutdown failed: %w", instance.label, err))
 		}
@@ -124,6 +133,7 @@ type monitorInstance struct {
 	outputStore *store.MultiStore
 	aggregator  *aggregator.Aggregator
 	watcher     *dockermonitor.Watcher
+	debug       bool
 }
 
 func newMonitorInstances(ctx context.Context, hostConfigs []config.ResolvedHostConfig, monitorStartedAt time.Time, logger *slog.Logger) ([]monitorInstance, error) {
@@ -131,108 +141,160 @@ func newMonitorInstances(ctx context.Context, hostConfigs []config.ResolvedHostC
 	multiHost := len(hostConfigs) > 1
 
 	for _, hostConfig := range hostConfigs {
-		cfg := hostConfig.Config
-		sinceDuration, err := cfg.SinceDuration()
-		if err != nil {
-			return nil, err
-		}
-		flushInterval, err := cfg.FlushIntervalDuration()
-		if err != nil {
-			return nil, err
-		}
-		backfillThreshold, err := cfg.BackfillThresholdDuration()
-		if err != nil {
-			return nil, err
-		}
-		backfillMaxDuration, err := cfg.BackfillMaxDurationDuration()
-		if err != nil {
-			return nil, err
-		}
-
-		client, err := newDockerClient(hostConfig.Host)
+		instance, err := newMonitorInstance(ctx, hostConfig, multiHost, monitorStartedAt, logger)
 		if err != nil {
 			closeMonitorInstances(instances)
 			return nil, err
 		}
-
-		label := dockerHostLabel(hostConfig.Host)
-		instanceLogger := logger.With(slog.String("docker_host", label))
-		outputStore := store.NewMultiStore(
-			store.NewFileStore(cfg.Storage.OutputDir),
-			store.NewBestEffortStore("dingtalk", store.NewDingTalkStore(
-				cfg.DingTalk.WebhookURL,
-				cfg.DingTalk.Secret,
-				cfg.DingTalk.AtAll,
-				cfg.DingTalk.AtMobiles,
-				cfg.DingTalk.MentionLevels,
-				cfg.DingTalk.MaxEvents,
-			), instanceLogger),
-		)
-		instanceLogger.Info("configured docker host",
-			slog.Any("patterns", cfg.Docker.IncludePatterns),
-			slog.String("output_dir", cfg.Storage.OutputDir),
-			slog.Bool("dingtalk_enabled", strings.TrimSpace(cfg.DingTalk.WebhookURL) != ""),
-		)
-		selfContainerID, err := dockermonitor.DetectSelfContainerID(ctx, client)
-		if err != nil {
-			_ = outputStore.Close()
-			_ = client.Close()
-			closeMonitorInstances(instances)
-			return nil, fmt.Errorf("detect self container on docker host %s: %w", label, err)
-		}
-		if selfContainerID != "" {
-			instanceLogger.Info("auto excluding monitor container logs", slog.String("container_id", selfContainerID))
-		}
-
-		logParser, err := parser.New(cfg.Filters, cfg.Aggregation.UnknownLogID)
-		if err != nil {
-			_ = outputStore.Close()
-			_ = client.Close()
-			closeMonitorInstances(instances)
-			return nil, err
-		}
-
-		logAggregator := aggregator.New(outputStore, cfg.Aggregation.FlushSize, flushInterval, cfg.Aggregation.UnknownLogID)
-		logReader := dockermonitor.NewLogReader(client)
-		watcher := dockermonitor.NewWatcher(client, logReader, cfg.Docker.IncludePatterns, selfContainerID, monitorStartedAt, sinceDuration, func(streamCtx context.Context, raw model.RawLog) error {
-			if multiHost {
-				raw.Container.Name = label + "/" + raw.Container.Name
-			}
-
-			event, ok, err := logParser.Parse(raw)
-			if err != nil {
-				instanceLogger.Warn("parse log failed",
-					slog.String("container", raw.Container.Name),
-					slog.String("error", err.Error()),
-				)
-				return nil
-			}
-			if !ok {
-				return nil
-			}
-			return logAggregator.Add(streamCtx, *event)
-		}, instanceLogger)
-		watcher.SetHealthSink(outputStore)
-		watcher.SetHealthContainerName(label + "/monitor")
-		watcher.SetBackfillController(logAggregator)
-		watcher.SetBackfillThresholds(backfillThreshold, backfillMaxDuration)
-		if backfillThreshold > 0 {
-			instanceLogger.Info("docker log backfill suppression enabled",
-				slog.Duration("backfill_threshold", backfillThreshold),
-				slog.Duration("backfill_max_duration", backfillMaxDuration),
-			)
-		}
-
-		instances = append(instances, monitorInstance{
-			label:       label,
-			client:      client,
-			outputStore: outputStore,
-			aggregator:  logAggregator,
-			watcher:     watcher,
-		})
+		instances = append(instances, instance)
 	}
 
 	return instances, nil
+}
+
+func newMonitorInstance(ctx context.Context, hostConfig config.ResolvedHostConfig, multiHost bool, monitorStartedAt time.Time, logger *slog.Logger) (monitorInstance, error) {
+	cfg := hostConfig.Config
+	sinceDuration, err := cfg.SinceDuration()
+	if err != nil {
+		return monitorInstance{}, err
+	}
+
+	client, err := newDockerClient(hostConfig.Host)
+	if err != nil {
+		return monitorInstance{}, err
+	}
+
+	label := dockerHostLabel(hostConfig.Host)
+	instanceLogger := logger.With(slog.String("docker_host", label))
+
+	selfContainerID, err := dockermonitor.DetectSelfContainerID(ctx, client)
+	if err != nil {
+		_ = client.Close()
+		return monitorInstance{}, fmt.Errorf("detect self container on docker host %s: %w", label, err)
+	}
+	if selfContainerID != "" {
+		instanceLogger.Info("auto excluding monitor container logs", slog.String("container_id", selfContainerID))
+	}
+
+	if hostConfig.Debug {
+		return newDebugMonitorInstance(client, cfg, label, multiHost, selfContainerID, monitorStartedAt, sinceDuration, instanceLogger), nil
+	}
+
+	flushInterval, err := cfg.FlushIntervalDuration()
+	if err != nil {
+		_ = client.Close()
+		return monitorInstance{}, err
+	}
+	backfillThreshold, err := cfg.BackfillThresholdDuration()
+	if err != nil {
+		_ = client.Close()
+		return monitorInstance{}, err
+	}
+	backfillMaxDuration, err := cfg.BackfillMaxDurationDuration()
+	if err != nil {
+		_ = client.Close()
+		return monitorInstance{}, err
+	}
+
+	outputStore := store.NewMultiStore(
+		store.NewFileStore(cfg.Storage.OutputDir),
+		store.NewBestEffortStore("dingtalk", store.NewDingTalkStore(
+			cfg.DingTalk.WebhookURL,
+			cfg.DingTalk.Secret,
+			cfg.DingTalk.AtAll,
+			cfg.DingTalk.AtMobiles,
+			cfg.DingTalk.MentionLevels,
+			cfg.DingTalk.MaxEvents,
+		), instanceLogger),
+	)
+	instanceLogger.Info("configured docker host",
+		slog.Any("patterns", cfg.Docker.IncludePatterns),
+		slog.String("output_dir", cfg.Storage.OutputDir),
+		slog.Bool("dingtalk_enabled", strings.TrimSpace(cfg.DingTalk.WebhookURL) != ""),
+	)
+
+	logParser, err := parser.New(cfg.Filters, cfg.Aggregation.UnknownLogID)
+	if err != nil {
+		_ = outputStore.Close()
+		_ = client.Close()
+		return monitorInstance{}, err
+	}
+
+	logAggregator := aggregator.New(outputStore, cfg.Aggregation.FlushSize, flushInterval, cfg.Aggregation.UnknownLogID)
+	logReader := dockermonitor.NewLogReader(client)
+	watcher := dockermonitor.NewWatcher(client, logReader, cfg.Docker.IncludePatterns, selfContainerID, monitorStartedAt, sinceDuration, func(streamCtx context.Context, raw model.RawLog) error {
+		if multiHost {
+			raw.Container.Name = label + "/" + raw.Container.Name
+		}
+
+		event, ok, err := logParser.Parse(raw)
+		if err != nil {
+			instanceLogger.Warn("parse log failed",
+				slog.String("container", raw.Container.Name),
+				slog.String("error", err.Error()),
+			)
+			return nil
+		}
+		if !ok {
+			return nil
+		}
+		return logAggregator.Add(streamCtx, *event)
+	}, instanceLogger)
+	watcher.SetHealthSink(outputStore)
+	watcher.SetHealthContainerName(label + "/monitor")
+	watcher.SetBackfillController(logAggregator)
+	watcher.SetBackfillThresholds(backfillThreshold, backfillMaxDuration)
+	if backfillThreshold > 0 {
+		instanceLogger.Info("docker log backfill suppression enabled",
+			slog.Duration("backfill_threshold", backfillThreshold),
+			slog.Duration("backfill_max_duration", backfillMaxDuration),
+		)
+	}
+
+	return monitorInstance{
+		label:       label,
+		client:      client,
+		outputStore: outputStore,
+		aggregator:  logAggregator,
+		watcher:     watcher,
+	}, nil
+}
+
+func newDebugMonitorInstance(client *dockermonitor.Client, cfg config.Config, label string, multiHost bool, selfContainerID string, monitorStartedAt time.Time, sinceDuration time.Duration, instanceLogger *slog.Logger) monitorInstance {
+	instanceLogger.Info("debug passthrough enabled, container logs will be printed to stdout only",
+		slog.Any("patterns", cfg.Docker.IncludePatterns),
+		slog.Duration("since", sinceDuration),
+	)
+
+	debugHandler := func(_ context.Context, raw model.RawLog) error {
+		ts := raw.Timestamp
+		if ts.IsZero() {
+			ts = time.Now().UTC()
+		}
+		container := raw.Container.Name
+		if multiHost {
+			container = label + "/" + container
+		}
+		// 单次 Fprintln 调用即一次 write syscall，多个 watcher goroutine
+		// 之间不会出现行级别的交错，无需额外加锁。
+		fmt.Fprintf(os.Stdout, "%s [%s] [%s] %s\n",
+			ts.Format(time.RFC3339Nano),
+			container,
+			raw.Stream,
+			raw.Line,
+		)
+		return nil
+	}
+
+	logReader := dockermonitor.NewLogReader(client)
+	watcher := dockermonitor.NewWatcher(client, logReader, cfg.Docker.IncludePatterns, selfContainerID, monitorStartedAt, sinceDuration, debugHandler, instanceLogger)
+
+	return monitorInstance{
+		label:   label,
+		client:  client,
+		watcher: watcher,
+		debug:   true,
+	}
 }
 
 func collectErrors(errCh <-chan error) error {
@@ -247,8 +309,12 @@ func collectErrors(errCh <-chan error) error {
 
 func closeMonitorInstances(instances []monitorInstance) {
 	for _, instance := range instances {
-		_ = instance.outputStore.Close()
-		_ = instance.client.Close()
+		if instance.outputStore != nil {
+			_ = instance.outputStore.Close()
+		}
+		if instance.client != nil {
+			_ = instance.client.Close()
+		}
 	}
 }
 

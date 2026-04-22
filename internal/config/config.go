@@ -34,6 +34,10 @@ type DockerHostConfig struct {
 	Aggregation     *AggregationOverrideConfig `yaml:"aggregation"`
 	DingTalk        *DingTalkOverrideConfig    `yaml:"dingtalk"`
 	Storage         *StorageOverrideConfig     `yaml:"storage"`
+	// Debug 开启后，该 docker host 仅把匹配 IncludePatterns 的容器日志原样
+	// 透传到控制台 stdout，跳过告警识别、log_id 提取、聚合、本地落盘和钉钉
+	// 通知，方便调试容器实际输出和验证 include_patterns 是否符合预期。
+	Debug bool `yaml:"debug"`
 }
 
 type FilterOverrideConfig struct {
@@ -78,6 +82,7 @@ type StorageOverrideConfig struct {
 type ResolvedHostConfig struct {
 	Host   string
 	Config Config
+	Debug  bool
 }
 
 func (c *DockerHostConfig) UnmarshalYAML(node *yaml.Node) error {
@@ -435,6 +440,7 @@ func (c Config) ResolveHosts() ([]ResolvedHostConfig, error) {
 		resolved = append(resolved, ResolvedHostConfig{
 			Host:   host,
 			Config: resolvedCfg,
+			Debug:  hostCfg.Debug,
 		})
 	}
 

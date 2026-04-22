@@ -112,6 +112,19 @@ func TestDockerConfigUnmarshalYAML(t *testing.T) {
 				},
 			},
 		},
+		{
+			name: "supports debug passthrough flag",
+			data: "hosts:\n  - host: ssh://coach_test\n    include_patterns: [\"api-*\"]\n    debug: true\n",
+			want: DockerConfig{
+				Hosts: []DockerHostConfig{
+					{
+						Host:            "ssh://coach_test",
+						IncludePatterns: []string{"api-*"},
+						Debug:           true,
+					},
+				},
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -238,6 +251,37 @@ func TestLoadKeepsDockerDefaultsWhenUsingHostOverridesOnly(t *testing.T) {
 	}
 	if !reflect.DeepEqual(resolved[0].Config.Docker.IncludePatterns, []string{"api-*"}) {
 		t.Fatalf("ResolveHosts()[0].Config.Docker.IncludePatterns = %v, want %v", resolved[0].Config.Docker.IncludePatterns, []string{"api-*"})
+	}
+}
+
+func TestConfigResolveHostsPropagatesDebugFlag(t *testing.T) {
+	t.Parallel()
+
+	cfg := defaultConfig()
+	cfg.Docker.Hosts = []DockerHostConfig{
+		{
+			Host:            "ssh://debug-host",
+			IncludePatterns: []string{"api-*"},
+			Debug:           true,
+		},
+		{
+			Host:            "ssh://normal-host",
+			IncludePatterns: []string{"api-*"},
+		},
+	}
+
+	resolved, err := cfg.ResolveHosts()
+	if err != nil {
+		t.Fatalf("ResolveHosts() error = %v", err)
+	}
+	if len(resolved) != 2 {
+		t.Fatalf("len(ResolveHosts()) = %d, want 2", len(resolved))
+	}
+	if !resolved[0].Debug {
+		t.Fatal("ResolveHosts()[0].Debug = false, want true")
+	}
+	if resolved[1].Debug {
+		t.Fatal("ResolveHosts()[1].Debug = true, want false")
 	}
 }
 

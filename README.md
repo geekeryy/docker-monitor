@@ -200,6 +200,7 @@ storage:
 - `host`: 单主机配置，兼容旧写法；会与 `hosts` 合并去重。
 - `include_patterns`: 容器名匹配规则，使用 Go `filepath.Match` 风格通配符。
 - `since`: 启动时回看历史日志时长，例如 `30s`、`5m`、`1h`。
+- `debug`: 仅作用于单个 host，开启后该 host 的容器日志会原样透传到控制台 stdout，**不**做告警识别、不聚合、不落盘、不发钉钉。详见下文「调试透传」。
 
 支持的 Docker Host 示例：
 
@@ -218,6 +219,36 @@ storage:
 - 如果远程主机短暂不可达、`dockerd` 重启、网络抖动导致事件流或同步失败，程序会持续重试，不需要人工重启。
 - 重连后会重新同步容器列表，并继续订阅 Docker 事件流。
 - 重连窗口内仍然可能出现少量重复日志；如果远端长时间不可达，则会持续重试并输出健康事件。
+
+#### 调试透传
+
+某些场景下你只想"看一眼某个 host 上某些容器到底在打什么日志"，而不需要落盘、聚合或推送。
+可以为该 host 单独开启 `debug: true`：
+
+```yaml
+docker:
+  hosts:
+    - host: "ssh://prod-a"
+      include_patterns:
+        - "api-*"
+      debug: true
+```
+
+开启后该 host 的行为变为：
+
+- 仍按 `include_patterns` 选中容器，仍遵循 `since` 回看历史；
+- 命中容器的日志会按 `时间戳 [容器名] [stdout|stderr] 原始内容` 的格式直接打印到 stdout；
+- **跳过** `filters.warn_match` / `filters.log_id_extract` 识别；
+- **跳过** 聚合，不写文件，不发钉钉；
+- 不再产生 `monitor.health.*` 健康事件。
+
+适用场景：
+
+- 验证 `include_patterns` 是否能正确选中目标容器；
+- 实地观察日志格式，再去调整 `warn_match.regexps`、`log_id_extract.json_keys` 等规则；
+- 排查"应该告警却没告警"的问题，对比原始日志和过滤规则。
+
+`debug` 是 host 级开关，多个 host 中只对开启的 host 生效，其它 host 仍走正常的告警/落盘/钉钉链路，互不干扰。建议在调试结束后及时关闭，避免日志量过大。
 
 ### `filters.warn_match`
 
