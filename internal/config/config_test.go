@@ -5,6 +5,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -309,6 +310,157 @@ func TestDefaultConfigSetsDingTalkMaxEvents(t *testing.T) {
 	cfg := defaultConfig()
 	if got := cfg.DingTalk.MaxEvents; got != 5 {
 		t.Fatalf("defaultConfig().DingTalk.MaxEvents = %d, want 5", got)
+	}
+}
+
+func TestDefaultConfigIncludesTencentSecurityScanIPs(t *testing.T) {
+	t.Parallel()
+
+	cfg := defaultConfig()
+	wantIPs := []string{
+		"106.55.202.118",
+		"113.96.223.69",
+		"125.39.132.125",
+		"43.139.209.119",
+	}
+	got := make(map[string]struct{}, len(cfg.Filters.WarnMatch.ExcludeIPs))
+	for _, ip := range cfg.Filters.WarnMatch.ExcludeIPs {
+		got[ip] = struct{}{}
+	}
+	for _, ip := range wantIPs {
+		if _, ok := got[ip]; !ok {
+			t.Fatalf("defaultConfig().Filters.WarnMatch.ExcludeIPs missing %q", ip)
+		}
+	}
+}
+
+func TestExcludeChainTTLDurationParses(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		ttl     string
+		want    time.Duration
+		wantErr bool
+	}{
+		{name: "empty disables", ttl: "", want: 0},
+		{name: "zero disables", ttl: "0s", want: 0},
+		{name: "ten minutes", ttl: "10m", want: 10 * time.Minute},
+		{name: "invalid duration", ttl: "abc", wantErr: true},
+		{name: "negative duration", ttl: "-1m", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := defaultConfig()
+			cfg.Filters.WarnMatch.ExcludeChainTTL = tt.ttl
+
+			got, err := cfg.ExcludeChainTTLDuration()
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("ExcludeChainTTLDuration() error = nil, want error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ExcludeChainTTLDuration() error = %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("ExcludeChainTTLDuration() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDefaultConfigEnablesExcludeChain(t *testing.T) {
+	t.Parallel()
+
+	cfg := defaultConfig()
+	got, err := cfg.ExcludeChainTTLDuration()
+	if err != nil {
+		t.Fatalf("ExcludeChainTTLDuration() error = %v", err)
+	}
+	if got != 10*time.Minute {
+		t.Fatalf("default ExcludeChainTTLDuration = %v, want 10m", got)
+	}
+}
+
+func TestConfigResolveHostsAppliesExcludeChainTTLOverride(t *testing.T) {
+	t.Parallel()
+
+	cfg := defaultConfig()
+	cfg.Docker.Hosts = []DockerHostConfig{
+		{
+			Host: "ssh://prod-a",
+			Filters: &FilterOverrideConfig{
+				WarnMatch: &WarnMatchOverrideConfig{
+					ExcludeChainTTL: stringPtr("30s"),
+				},
+			},
+		},
+		{
+			Host: "ssh://prod-b",
+			Filters: &FilterOverrideConfig{
+				WarnMatch: &WarnMatchOverrideConfig{
+					ExcludeChainTTL: stringPtr(""),
+				},
+			},
+		},
+		{
+			Host: "ssh://prod-c",
+		},
+	}
+
+	resolved, err := cfg.ResolveHosts()
+	if err != nil {
+		t.Fatalf("ResolveHosts() error = %v", err)
+	}
+	if got := resolved[0].Config.Filters.WarnMatch.ExcludeChainTTL; got != "30s" {
+		t.Fatalf("prod-a ExcludeChainTTL = %q, want %q", got, "30s")
+	}
+	if got := resolved[1].Config.Filters.WarnMatch.ExcludeChainTTL; got != "" {
+		t.Fatalf("prod-b ExcludeChainTTL = %q, want empty (disabled)", got)
+	}
+	if got := resolved[2].Config.Filters.WarnMatch.ExcludeChainTTL; got != "10m" {
+		t.Fatalf("prod-c ExcludeChainTTL = %q, want default %q", got, "10m")
+	}
+}
+
+func TestConfigResolveHostsAppliesExcludeIPsOverride(t *testing.T) {
+	t.Parallel()
+
+	cfg := defaultConfig()
+	cfg.Docker.Hosts = []DockerHostConfig{
+		{
+			Host: "ssh://prod-a",
+			Filters: &FilterOverrideConfig{
+				WarnMatch: &WarnMatchOverrideConfig{
+					ExcludeIPs: []string{"10.0.0.1"},
+				},
+			},
+		},
+		{
+			Host: "ssh://prod-b",
+		},
+	}
+
+	resolved, err := cfg.ResolveHosts()
+	if err != nil {
+		t.Fatalf("ResolveHosts() error = %v", err)
+	}
+	if len(resolved) != 2 {
+		t.Fatalf("len(ResolveHosts()) = %d, want 2", len(resolved))
+	}
+
+	if got := resolved[0].Config.Filters.WarnMatch.ExcludeIPs; !reflect.DeepEqual(got, []string{"10.0.0.1"}) {
+		t.Fatalf("prod-a ExcludeIPs = %v, want [10.0.0.1]", got)
+	}
+
+	defaultIPs := defaultConfig().Filters.WarnMatch.ExcludeIPs
+	if got := resolved[1].Config.Filters.WarnMatch.ExcludeIPs; !reflect.DeepEqual(got, defaultIPs) {
+		t.Fatalf("prod-b ExcludeIPs = %v, want default %v", got, defaultIPs)
 	}
 }
 

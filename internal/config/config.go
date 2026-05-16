@@ -46,11 +46,13 @@ type FilterOverrideConfig struct {
 }
 
 type WarnMatchOverrideConfig struct {
-	Regexps        []string `yaml:"regexps"`
-	ExcludeRegexps []string `yaml:"exclude_regexps"`
-	JSONFields     []string `yaml:"json_fields"`
-	MessageFields  []string `yaml:"message_fields"`
-	TimeFields     []string `yaml:"time_fields"`
+	Regexps         []string `yaml:"regexps"`
+	ExcludeRegexps  []string `yaml:"exclude_regexps"`
+	ExcludeIPs      []string `yaml:"exclude_ips"`
+	ExcludeChainTTL *string  `yaml:"exclude_chain_ttl"`
+	JSONFields      []string `yaml:"json_fields"`
+	MessageFields   []string `yaml:"message_fields"`
+	TimeFields      []string `yaml:"time_fields"`
 }
 
 type LogIDExtractOverrideConfig struct {
@@ -165,12 +167,27 @@ type FilterConfig struct {
 	LogIDExtract LogIDExtractConfig `yaml:"log_id_extract"`
 }
 
+// WarnMatchConfig 描述告警识别相关的过滤规则。
+//
+// ExcludeIPs 是「白名单 IP 列表」，命中任意一条会直接跳过该日志，
+// 不参与告警识别和聚合。和 ExcludeRegexps 的区别：
+//   - 配置时直接写 IP，不需要写正则
+//   - Parser 内部自动 QuoteMeta 并加词边界，避免 1.1.1.10 被 1.1.1.1
+//     误匹配
+//   - 适合稳定的可信来源 IP（例如平台安服扫描器、内部探活节点）
+//
+// ExcludeChainTTL 控制「链路级过滤」的存活时间。当一条日志命中
+// ExcludeIPs 或 ExcludeRegexps 时，会记录其 log_id；在 TTL 内同一
+// log_id 的所有后续日志都会被静默，避免链路中后续不带 IP 的告警漏出。
+// 留空或填 "0s" 关闭该功能，仅做单条过滤。
 type WarnMatchConfig struct {
-	Regexps        []string `yaml:"regexps"`
-	ExcludeRegexps []string `yaml:"exclude_regexps"`
-	JSONFields     []string `yaml:"json_fields"`
-	MessageFields  []string `yaml:"message_fields"`
-	TimeFields     []string `yaml:"time_fields"`
+	Regexps         []string `yaml:"regexps"`
+	ExcludeRegexps  []string `yaml:"exclude_regexps"`
+	ExcludeIPs      []string `yaml:"exclude_ips"`
+	ExcludeChainTTL string   `yaml:"exclude_chain_ttl"`
+	JSONFields      []string `yaml:"json_fields"`
+	MessageFields   []string `yaml:"message_fields"`
+	TimeFields      []string `yaml:"time_fields"`
 }
 
 type LogIDExtractConfig struct {
@@ -233,10 +250,19 @@ func defaultConfig() Config {
 		},
 		Filters: FilterConfig{
 			WarnMatch: WarnMatchConfig{
-				Regexps:       []string{`(?i)\b(WARN|ERROR)\b`},
-				JSONFields:    []string{"level", "severity"},
-				MessageFields: []string{"message", "msg", "log"},
-				TimeFields:    []string{"time", "timestamp", "@timestamp", "ts"},
+				Regexps: []string{`(?i)\b(WARN|ERROR)\b`},
+				ExcludeIPs: []string{
+					// 腾讯云官方安服团队专用扫描 IP，命中即过滤
+					// 参考：https://cloud.tencent.com/document/product/296/91450
+					"106.55.202.118",
+					"113.96.223.69",
+					"125.39.132.125",
+					"43.139.209.119",
+				},
+				ExcludeChainTTL: "10m",
+				JSONFields:      []string{"level", "severity"},
+				MessageFields:   []string{"message", "msg", "log"},
+				TimeFields:      []string{"time", "timestamp", "@timestamp", "ts"},
 			},
 			LogIDExtract: LogIDExtractConfig{
 				JSONKeys: []string{"log_id", "logId", "alert_id", "alertId", "trace_id", "traceId"},
@@ -290,6 +316,9 @@ func (c Config) validateResolved() error {
 		return err
 	}
 	if _, err := c.BackfillMaxDurationDuration(); err != nil {
+		return err
+	}
+	if _, err := c.ExcludeChainTTLDuration(); err != nil {
 		return err
 	}
 	if c.Aggregation.UnknownLogID == "" {
@@ -372,6 +401,23 @@ func (c Config) BackfillMaxDurationDuration() (time.Duration, error) {
 	}
 	if d < 0 {
 		return 0, fmt.Errorf("aggregation.backfill_max_duration must be >= 0")
+	}
+	return d, nil
+}
+
+// ExcludeChainTTLDuration parses filters.warn_match.exclude_chain_ttl.
+// 空字符串或 "0s" 表示关闭链路过滤，返回 0；负数报错。
+func (c Config) ExcludeChainTTLDuration() (time.Duration, error) {
+	value := strings.TrimSpace(c.Filters.WarnMatch.ExcludeChainTTL)
+	if value == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(value)
+	if err != nil {
+		return 0, fmt.Errorf("parse filters.warn_match.exclude_chain_ttl: %w", err)
+	}
+	if d < 0 {
+		return 0, fmt.Errorf("filters.warn_match.exclude_chain_ttl must be >= 0")
 	}
 	return d, nil
 }
@@ -483,6 +529,12 @@ func applyWarnMatchOverrides(dst *WarnMatchConfig, override *WarnMatchOverrideCo
 	}
 	if override.ExcludeRegexps != nil {
 		dst.ExcludeRegexps = append([]string(nil), override.ExcludeRegexps...)
+	}
+	if override.ExcludeIPs != nil {
+		dst.ExcludeIPs = append([]string(nil), override.ExcludeIPs...)
+	}
+	if override.ExcludeChainTTL != nil {
+		dst.ExcludeChainTTL = *override.ExcludeChainTTL
 	}
 	if override.JSONFields != nil {
 		dst.JSONFields = append([]string(nil), override.JSONFields...)

@@ -9,8 +9,18 @@ filters:
   warn_match:
     regexps:
       - '(?i)\b(WARN|ERROR)\b'
-    exclude_regexps:
-      - '\b(?:106\.55\.202\.118|113\.96\.223\.69|125\.39\.132\.125|43\.139\.209\.119)\b'
+    exclude_regexps: []
+    # 白名单 IP，命中后整条日志不告警；和 exclude_regexps 区别在于无需自己写正则
+    exclude_ips:
+      # 腾讯云官方安服团队专用扫描 IP
+      - "106.55.202.118"
+      - "113.96.223.69"
+      - "125.39.132.125"
+      - "43.139.209.119"
+    # 链路级过滤：当一条日志命中 exclude_ips/exclude_regexps 时，记录其 log_id，
+    # 在 TTL 内同一 log_id 的所有后续日志（包括不带 IP 的 ERROR/WARN）都会被静默，
+    # 避免链路中后半段告警漏出。留空或 "0s" 关闭。
+    exclude_chain_ttl: "10m"
     json_fields:
       - "level"
     message_fields:
