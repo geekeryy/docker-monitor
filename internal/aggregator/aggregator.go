@@ -21,33 +21,55 @@ type Aggregator struct {
 	flushInterval time.Duration
 	unknownLogID  string
 	maxGroupSize  int
+	maxGroups     int
+	groupTTL      time.Duration
 
 	mu     sync.Mutex
 	groups map[string]*groupBuffer
 
 	activeBackfills atomic.Int32
 	backfillAlerts  atomic.Int64
+
+	now func() time.Time
 }
 
 type groupBuffer struct {
-	firstSeen  time.Time
-	lastSeen   time.Time
-	containers map[string]struct{}
-	hasAlert   bool
-	events     []model.LogEvent
+	firstSeen   time.Time
+	lastSeen    time.Time
+	lastTouched time.Time
+	containers  map[string]struct{}
+	hasAlert    bool
+	events      []model.LogEvent
 }
 
 const maxBufferedEventsFactor = 10
 
-func New(store Store, flushSize int, flushInterval time.Duration, unknownLogID string) *Aggregator {
+func New(store Store, flushSize int, flushInterval time.Duration, unknownLogID string, maxGroups int, groupTTL time.Duration) *Aggregator {
+	if maxGroups < 0 {
+		maxGroups = 0
+	}
+	if groupTTL < 0 {
+		groupTTL = 0
+	}
 	return &Aggregator{
 		store:         store,
 		flushSize:     flushSize,
 		flushInterval: flushInterval,
 		unknownLogID:  unknownLogID,
 		maxGroupSize:  maxBufferedEvents(flushSize),
+		maxGroups:     maxGroups,
+		groupTTL:      groupTTL,
 		groups:        make(map[string]*groupBuffer),
+		now:           func() time.Time { return time.Now().UTC() },
 	}
+}
+
+// SetNowFunc 替换 Aggregator 内部使用的时间源，仅用于测试。
+func (a *Aggregator) SetNowFunc(fn func() time.Time) {
+	if fn == nil {
+		return
+	}
+	a.now = fn
 }
 
 func (a *Aggregator) Run(ctx context.Context) error {
@@ -143,16 +165,22 @@ func (a *Aggregator) add(event model.LogEvent) (model.LogBatch, bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
+	now := a.now()
+	a.evictGroupsLocked(now)
+
 	key := event.LogID
 	buffer, ok := a.groups[key]
 	if !ok {
 		buffer = &groupBuffer{
-			firstSeen:  event.Timestamp,
-			lastSeen:   event.Timestamp,
-			containers: make(map[string]struct{}),
+			firstSeen:   event.Timestamp,
+			lastSeen:    event.Timestamp,
+			lastTouched: now,
+			containers:  make(map[string]struct{}),
 		}
 		a.groups[key] = buffer
 	}
+
+	buffer.lastTouched = now
 
 	if buffer.firstSeen.IsZero() || event.Timestamp.Before(buffer.firstSeen) {
 		buffer.firstSeen = event.Timestamp
@@ -171,6 +199,13 @@ func (a *Aggregator) add(event model.LogEvent) (model.LogBatch, bool) {
 	buffer.containers[event.Container.Name] = struct{}{}
 	buffer.hasAlert = buffer.hasAlert || event.AlertMatched
 
+	if !buffer.hasAlert && len(buffer.events) >= a.maxGroupSize {
+		delete(a.groups, key)
+		return model.LogBatch{}, false
+	}
+
+	a.evictGroupsLocked(now)
+
 	if !buffer.hasAlert || len(buffer.events) < a.flushSize {
 		return model.LogBatch{}, false
 	}
@@ -183,6 +218,8 @@ func (a *Aggregator) add(event model.LogEvent) (model.LogBatch, bool) {
 func (a *Aggregator) drainAll() []model.LogBatch {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+
+	a.evictGroupsLocked(a.now())
 
 	batches := make([]model.LogBatch, 0, len(a.groups))
 	for key, buffer := range a.groups {
@@ -197,6 +234,50 @@ func (a *Aggregator) drainAll() []model.LogBatch {
 	}
 
 	return batches
+}
+
+func (a *Aggregator) evictGroupsLocked(now time.Time) {
+	if a.groupTTL > 0 {
+		for key, buffer := range a.groups {
+			if buffer.hasAlert {
+				continue
+			}
+			if now.Sub(buffer.lastTouched) >= a.groupTTL {
+				delete(a.groups, key)
+			}
+		}
+	}
+
+	if a.maxGroups <= 0 || len(a.groups) <= a.maxGroups {
+		return
+	}
+
+	type candidate struct {
+		key       string
+		lastTouch time.Time
+	}
+	candidates := make([]candidate, 0, len(a.groups))
+	for key, buffer := range a.groups {
+		if buffer.hasAlert {
+			continue
+		}
+		candidates = append(candidates, candidate{key: key, lastTouch: buffer.lastTouched})
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].lastTouch.Before(candidates[j].lastTouch)
+	})
+
+	need := len(a.groups) - a.maxGroups
+	for _, item := range candidates {
+		if need <= 0 {
+			break
+		}
+		if _, ok := a.groups[item.key]; !ok {
+			continue
+		}
+		delete(a.groups, item.key)
+		need--
+	}
 }
 
 func snapshotBatch(key string, buffer *groupBuffer) model.LogBatch {

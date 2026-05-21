@@ -27,20 +27,22 @@ set -eu
 # --- 钉钉机器人 (告警模式必填, 加签) -------------------------
 # 创建步骤: 钉钉群 -> 群设置 -> 智能群助手 -> 添加机器人 -> 自定义
 # 安全设置勾选 "加签", 把 webhook 和签名密钥填到下面
-DT_WEBHOOK=""
-DT_SECRET=""
+DT_WEBHOOK="TODO"
+DT_SECRET="TODO"
+
+# 受信任的成功登录 IP (空格分隔): 不触发新登录告警, 展示时仅汇总次数与时间范围
+TRUSTED_SUCCESS_IPS="TODO"
+
 # --- 告警阈值 / 窗口 -----------------------------------------
-ALERT_DAYS=1                    # 告警模式默认时间窗口 (天)
+ALERT_DAYS=1                    # 告警模式默认时间窗口 (天, 滚动 N*24h, 见 compute_analysis_window)
 ALERT_FAIL_THRESHOLD=20         # 单 IP 失败次数 >= 该值才进入告警
-ALERT_TOP_N=10                  # 告警里最多展示前 N 个攻击 IP
+ALERT_TOP_N=20                  # 告警里最多展示前 N 个攻击 IP
 ALERT_DEDUP_HOURS=24            # 同一 IP / 同一高危事件 N 小时内不重复推送
 
 # --- 告警类型开关 --------------------------------------------
 ALERT_NOTIFY_NEW_SUCCESS=1      # 1=对新成功登录告警, 0=关闭
 ALERT_NOTIFY_HIGH_RISK=1        # 1=对高危事件告警 (root 被试 / max_attempts), 0=关闭
 
-# 受信任的成功登录 IP, 这些 IP 上的成功登录不告警 (空格分隔)
-TRUSTED_SUCCESS_IPS=""
 
 # --- 群通知 --------------------------------------------------
 ALERT_AT_MOBILES=""             # @ 谁 (空格分隔的手机号), 留空表示不 @
@@ -223,8 +225,19 @@ detect_source() {
 }
 
 SOURCE="$(detect_source)"
+
+# 滚动窗口: 自「此刻往前 N*24 小时」起 (非自然日 0 点). 例: 今天 09:00 跑 -d 1 不含昨天 08:00 的记录.
+compute_analysis_window() {
+    WINDOW_SINCE_TS=$(date -d "${DAYS} days ago" +%s 2>/dev/null || \
+        python3 -c "import time; print(int(time.time()-${DAYS}*86400))")
+    WINDOW_UNTIL_TS=$(date +%s)
+    WINDOW_SINCE_ISO=$(date -d "@${WINDOW_SINCE_TS}" '+%F %T %Z' 2>/dev/null || date -r "$WINDOW_SINCE_TS" '+%F %T %Z')
+    WINDOW_UNTIL_ISO=$(date -d "@${WINDOW_UNTIL_TS}" '+%F %T %Z' 2>/dev/null || date '+%F %T %Z')
+}
+compute_analysis_window
+
 log_info "日志源: ${C_BOLD}${SOURCE}${C_RESET}"
-log_info "分析范围: 最近 ${C_BOLD}${DAYS}${C_RESET} 天"
+log_info "分析范围: ${C_BOLD}${WINDOW_SINCE_ISO}${C_RESET} ~ ${C_BOLD}${WINDOW_UNTIL_ISO}${C_RESET} (滚动 ${DAYS} 天)"
 
 # ---------- 取出原始日志 ----------
 # 输出统一为以日志行为单位, 带时间前缀 (journalctl 用 --output=short-iso 让时间可解析)
@@ -232,14 +245,12 @@ fetch_logs() {
     case "$SOURCE" in
         journal)
             journalctl -u ssh -u sshd \
-                --since "${DAYS} days ago" \
+                --since "@${WINDOW_SINCE_TS}" \
                 --output=short-iso --no-pager 2>/dev/null
             ;;
         file:*)
             local path="${SOURCE#file:}"
-            local since_ts
-            since_ts=$(date -d "${DAYS} days ago" +%s 2>/dev/null || \
-                       python3 -c "import time; print(int(time.time()-${DAYS}*86400))")
+            local since_ts="$WINDOW_SINCE_TS"
             # 同时读取 path 和它的 logrotate 历史 (path.1, path.2.gz, ...)
             local files=("$path")
             for ext in 1 2 3 4 5 6 7; do
@@ -429,6 +440,63 @@ awk -v ip_filter="$FILTER_IP" -v user_filter="$FILTER_USER" '
 FAIL_TOTAL=$(wc -l < "$FAIL_TSV" | tr -d ' ')
 SUCC_TOTAL=$(wc -l < "$SUCC_TSV" | tr -d ' ')
 
+trusted_ips_json() {
+    # shellcheck disable=SC2086
+    printf '%s\n' ${TRUSTED_SUCCESS_IPS:-} | jq -R . | jq -sc 'map(select(. != ""))'
+}
+
+# 从成功登录 TSV 提取受信任 IP 的登录指纹 (供 state.known_success 去重用)
+trusted_succ_keys_from_tsv() {
+    local trusted_json="$1"
+    if [[ ! -s "$SUCC_TSV" ]]; then
+        echo '[]'
+        return
+    fi
+    jq -R -s --argjson trusted "$trusted_json" '
+        def trusted_ip($ip): ($trusted | index($ip)) != null;
+        split("\n")
+        | map(select(length > 0) | split("\t") | select(length >= 4)
+            | {time: .[0], user: .[1], ip: .[2], method: .[3]})
+        | map(select(trusted_ip(.ip)))
+        | map(.time + "|" + .user + "|" + .ip + "|" + .method)
+    ' "$SUCC_TSV"
+}
+
+# 按 IP 聚合成功登录, 拆分为可信 / 非可信两组 (供报告与告警展示)
+build_success_summaries() {
+    local trusted_json="$1"
+    if [[ ! -s "$SUCC_TSV" ]]; then
+        echo '{"trusted":[],"untrusted":[]}'
+        return
+    fi
+    jq -R -s --argjson trusted "$trusted_json" '
+        def logins:
+            split("\n")
+            | map(select(length > 0) | split("\t") | select(length >= 4)
+                | {time: .[0], user: .[1], ip: .[2], method: .[3]});
+        def trusted_ip($ip): ($trusted | index($ip)) != null;
+        def aggregate:
+            group_by(.ip)
+            | map({
+                ip: .[0].ip,
+                count: length,
+                first_time: (map(.time) | min),
+                last_time: (map(.time) | max),
+                users: ([.[].user] | unique | join(",")),
+                methods: ([.[].method] | unique | join(","))
+              })
+            | sort_by(-.count);
+        (logins) as $all
+        | {
+            trusted: ($all | map(select(trusted_ip(.ip))) | aggregate),
+            untrusted: ($all | map(select(trusted_ip(.ip) | not)) | aggregate)
+          }
+    ' "$SUCC_TSV"
+}
+
+TRUSTED_IPS_JSON="$(trusted_ips_json)"
+SUCCESS_SUMMARIES_JSON="$(build_success_summaries "$TRUSTED_IPS_JSON")"
+
 # ---------- GeoIP ----------
 geoip_of() {
     local ip="$1"
@@ -480,6 +548,8 @@ build_report_json() {
 
     jq -n \
         --arg source "$SOURCE" \
+        --arg window_since "$WINDOW_SINCE_ISO" \
+        --arg window_until "$WINDOW_UNTIL_ISO" \
         --argjson days "$DAYS" \
         --argjson failed_total "$FAIL_TOTAL" \
         --argjson success_total "$SUCC_TOTAL" \
@@ -487,9 +557,12 @@ build_report_json() {
         --argjson top_users "$top_users" \
         --argjson privileged_user_failures "$privileged_user_failures" \
         --argjson reason_distribution "$reason_distribution" \
-        --argjson successful_logins "$successful_logins" '
+        --argjson successful_logins "$successful_logins" \
+        --argjson success_summaries "$SUCCESS_SUMMARIES_JSON" '
         {
             source: $source,
+            window_since: $window_since,
+            window_until: $window_until,
             days: $days,
             failed_total: $failed_total,
             success_total: $success_total,
@@ -497,7 +570,8 @@ build_report_json() {
             top_users: $top_users,
             privileged_user_failures: $privileged_user_failures,
             reason_distribution: $reason_distribution,
-            successful_logins: $successful_logins
+            successful_logins: $successful_logins,
+            success_summaries: $success_summaries
         }
     '
 }
@@ -534,14 +608,29 @@ if [[ $ALERT_MODE -eq 1 ]]; then
     NOW_TS=$(date +%s)
     NOW_ISO=$(date '+%F %T %Z')
 
-    # 读出旧 state
-    ALERTED_IPS_JSON=$(jq -c '.alerted_ips // {}'  "$STATE_FILE")
-    KNOWN_SUCCESS_JSON=$(jq -c '.known_success // []' "$STATE_FILE")
-    HIGH_RISK_SEEN_JSON=$(jq -c '.high_risk_seen // {}' "$STATE_FILE")
+    # 读出旧 state (兼容 alerted_ips / high_risk_seen 曾被写成数组的旧格式)
+    ALERTED_IPS_JSON=$(jq -c '(.alerted_ips // {}) | if type == "object" then . else {} end' "$STATE_FILE")
+    KNOWN_SUCCESS_JSON=$(jq -c '(.known_success // []) | if type == "array" then . else [] end' "$STATE_FILE")
+    HIGH_RISK_SEEN_JSON=$(jq -c '(.high_risk_seen // {}) | if type == "object" then . else {} end' "$STATE_FILE")
 
-    # 受信任 IP → JSON array
-    # shellcheck disable=SC2086
-    TRUSTED_IPS_JSON=$(printf '%s\n' ${TRUSTED_SUCCESS_IPS:-} | jq -R . | jq -sc 'map(select(. != ""))')
+    # jq 复用: 规范化报告里的攻击 IP / 成功登录列表, 避免 success_summaries 形状误入
+    JQ_DEF_ATTACK_AND_LOGIN=$(cat <<'JQDEF'
+def as_attack_ip_records:
+  . // []
+  | if type == "object" and ((.trusted? != null) or (.untrusted? != null)) then []
+    elif type == "array" then
+      [.[] | select(type == "object" and (.ip? != null) and (.count? != null))]
+    else [] end;
+def as_login_records:
+  . // []
+  | if type == "object" and ((.trusted? != null) or (.untrusted? != null)) then []
+    elif type == "array" then
+      [.[] | select(type == "object" and (.time? != null) and (.ip? != null)
+        and (.user? != null) and (.method? != null))]
+    else [] end;
+
+JQDEF
+)
 
     # === 5. 算增量 ===
     # 5.1 新攻击 IP (含去重)
@@ -550,8 +639,9 @@ if [[ $ALERT_MODE -eq 1 ]]; then
         --argjson alerted "$ALERTED_IPS_JSON" \
         --argjson dedup_h "$ALERT_DEDUP_HOURS" \
         --argjson now_ts "$NOW_TS" \
-        --argjson topn "$TOP_N" '
-        .top_attack_ips // [] |
+        --argjson topn "$TOP_N" \
+        "${JQ_DEF_ATTACK_AND_LOGIN}"'
+        (.top_attack_ips | as_attack_ip_records) |
         map(select(.count >= $threshold)) |
         map(select(
             (($alerted[.ip] // 0) | tonumber) as $last_ts |
@@ -563,16 +653,19 @@ if [[ $ALERT_MODE -eq 1 ]]; then
     # 5.2 新成功登录 (按 time|user|ip|method 去重, 排除受信任 IP)
     NEW_SUCCESS=$(jq -c \
         --argjson known "$KNOWN_SUCCESS_JSON" \
-        --argjson trusted "$TRUSTED_IPS_JSON" '
-        (.successful_logins // []) |
+        --argjson trusted "$TRUSTED_IPS_JSON" \
+        "${JQ_DEF_ATTACK_AND_LOGIN}"'
+        (.successful_logins | as_login_records) |
         map(. + {key: (.time + "|" + .user + "|" + .ip + "|" + .method)}) |
         map(. as $login | select(
             (($known | index($login.key)) == null)
             and (($trusted | index($login.ip)) == null)
         ))
     ' <<< "$REPORT")
-    CURRENT_SUCCESS_KEYS=$(jq -c '
-        [(.successful_logins // [])[] | .time + "|" + .user + "|" + .ip + "|" + .method]
+    CURRENT_SUCCESS_KEYS=$(jq -c \
+        "${JQ_DEF_ATTACK_AND_LOGIN}"'
+        [.successful_logins | as_login_records[]
+            | .time + "|" + .user + "|" + .ip + "|" + .method]
     ' <<< "$REPORT")
 
     # 5.3 高危事件 (root/admin 被试 / max_attempts), 按指纹去重
@@ -617,12 +710,15 @@ if [[ $ALERT_MODE -eq 1 ]]; then
 
     # === 6. 给攻击 IP 附加 GeoIP (如果开了 --geoip) ===
     if [[ $SHOW_GEOIP -eq 1 ]] && command -v geoiplookup >/dev/null 2>&1; then
-        NEW_ATTACK_IPS=$(echo "$NEW_ATTACK_IPS" | jq -c '.[]' |
+        NEW_ATTACK_IPS=$(
+            echo "$NEW_ATTACK_IPS" | jq -c "${JQ_DEF_ATTACK_AND_LOGIN} as_attack_ip_records | .[]" |
             while IFS= read -r row; do
+                [[ -z "$row" ]] && continue
                 ip=$(echo "$row" | jq -r '.ip')
                 geo=$(geoiplookup "$ip" 2>/dev/null | head -n1 | sed 's/^GeoIP[^:]*: //')
-                echo "$row" | jq -c --arg geo "$geo" '. + {geo: $geo}'
-            done | jq -sc .)
+                echo "$row" | jq -c --arg geo "$geo" '.geo = $geo'
+            done | jq -sc .
+        )
     fi
 
     # === 7. 构造 markdown ===
@@ -648,10 +744,15 @@ if [[ $ALERT_MODE -eq 1 ]]; then
         def line(s): s + "\n";
         def section(s): "\n#### " + s + "\n";
         def login_line: "- 时间: `\(.time)`  来源 IP: `\(.ip)`  用户: **\(.user)**  方式: \(.method)";
+        def trusted_summary_line:
+            "- IP: `\(.ip)`  共 **\(.count)** 次  时间: `\(.first_time)` ~ `\(.last_time)`";
+        def untrusted_summary_line:
+            "- IP: `\(.ip)`  共 **\(.count)** 次  时间: `\(.first_time)` ~ `\(.last_time)`  用户: \(.users)  方式: \(.methods)";
 
         line("### SSH 安全告警 — \($host)")
-        + line("> 时间: \($now)  /  扫描窗口: 最近 \($days) 天  /  阈值: \($threshold) 次")
-        + line("> 失败总数: **\($report.failed_total // 0)**, 成功登录: **\($report.success_total // 0)**")
+        + line("> 推送时间: \($now)")
+        + line("> 扫描窗口: `\($report.window_since // "?")` ~ `\($report.window_until // "?")` (滚动 \($days) 天, 非自然日)")
+        + line("> 失败总数: **\($report.failed_total // 0)**, 成功登录: **\($report.success_total // 0)**, 阈值: \($threshold) 次")
 
         + ( if ($high_risk.root_wrong_pw | length) > 0 then
               section("⚠️ 高危: 特权账号被尝试密码")
@@ -663,14 +764,19 @@ if [[ $ALERT_MODE -eq 1 ]]; then
               + line("- 共 **\($high_risk.max_attempts_count)** 次, 典型爆破特征")
             else "" end )
 
+        + ( if (($report.success_summaries.trusted // []) | length) > 0 then
+              section("✅ 可信 IP 成功登录 (窗口内汇总)")
+              + ( ($report.success_summaries.trusted // []) | map(trusted_summary_line) | join("\n") ) + "\n"
+            else "" end )
+
         + ( if ($new_success | length) > 0 then
-              section("🚨 新成功登录事件")
+              section("🚨 新成功登录 (非可信 IP)")
               + ( $new_success | map(login_line) | join("\n") ) + "\n"
             else "" end )
 
-        + ( if (($new_success | length) == 0 and (($report.successful_logins // []) | length) > 0) then
-              section("成功登录明细 (最近 \([(($report.successful_logins // []) | length), $topn] | min) 条)")
-              + ( ($report.successful_logins // []) | reverse | .[0:$topn] | map(login_line) | join("\n") ) + "\n"
+        + ( if (($report.success_summaries.untrusted // []) | length) > 0 then
+              section("成功登录汇总 (非可信 IP, 窗口内全部)")
+              + ( ($report.success_summaries.untrusted // []) | map(untrusted_summary_line) | join("\n") ) + "\n"
             else "" end )
 
         + ( if ($new_ips | length) > 0 then
@@ -741,10 +847,13 @@ ${secret}"
     fi
 
     # === 9. 更新 state ===
-    NEW_ALERTED_IPS=$(jq -c --argjson now "$NOW_TS" '
-        map({key: .ip, value: $now}) | from_entries
+    NEW_ALERTED_IPS=$(jq -c --argjson now "$NOW_TS" \
+        "${JQ_DEF_ATTACK_AND_LOGIN}"'
+        as_attack_ip_records
+        | map({key: .ip, value: $now}) | from_entries
     ' <<< "$NEW_ATTACK_IPS")
-    NEW_SUCC_KEYS=$(jq -c '[.[].key]' <<< "$NEW_SUCCESS")
+    NEW_SUCC_KEYS=$(jq -c '[.[] | select(type == "object") | .key]' <<< "$NEW_SUCCESS")
+    TRUSTED_SUCC_KEYS="$(trusted_succ_keys_from_tsv "$TRUSTED_IPS_JSON")"
     NEW_HIGH_RISK_SEEN=$(jq -c --argjson now "$NOW_TS" '
         [
             (.root_wrong_pw[]?  | {key: ("root_wrong_pw:" + .user), value: $now}),
@@ -755,11 +864,12 @@ ${secret}"
     UPDATED=$(jq -c \
         --argjson new_alerted   "$NEW_ALERTED_IPS" \
         --argjson new_succ_keys "$NEW_SUCC_KEYS" \
+        --argjson trusted_succ_keys "$TRUSTED_SUCC_KEYS" \
         --argjson current_succ_keys "$CURRENT_SUCCESS_KEYS" \
         --argjson new_hr_seen   "$NEW_HIGH_RISK_SEEN" '
         .alerted_ips    = ((.alerted_ips    // {}) + $new_alerted)        |
         .known_success  = (
-            (.known_success // []) + $new_succ_keys |
+            (.known_success // []) + $new_succ_keys + $trusted_succ_keys |
             unique |
             map(. as $key | select(($current_succ_keys | index($key)) != null))
         ) |
@@ -844,46 +954,47 @@ while read -r cnt reason; do
 done
 
 # ---- 4. 成功登录记录 ----
+print_success_summary_rows() {
+    local rows_json="$1"
+    local color="${2:-$C_GREEN}"
+    local trusted_only="${3:-0}"
+    jq -r '.[] |
+        if .first_time != .last_time then
+            "\(.count)\t\(.ip)\t\(.first_time) ~ \(.last_time)\t\(.users // "")\t\(.methods // "")"
+        else
+            "\(.count)\t\(.ip)\t\(.first_time)\t\(.users // "")\t\(.methods // "")"
+        end
+    ' <<< "$rows_json" |
+    while IFS=$'\t' read -r cnt ip ts_show users methods; do
+        if [[ "$trusted_only" -eq 1 ]]; then
+            printf "  ${color}%-6s${C_RESET}  %-18s  %-37s\n" "$cnt" "$ip" "$ts_show"
+        else
+            printf "  ${color}%-6s${C_RESET}  %-18s  %-37s  %-22s  %s\n" \
+                "$cnt" "$ip" "$ts_show" "$users" "$methods"
+        fi
+    done
+}
+
 if [[ $SHOW_SUCCESS -eq 1 ]]; then
-    print_section "成功登录记录 (重点关注是否存在异常 IP / 时间)"
+    trusted_rows=$(jq -c '.trusted // []' <<< "$SUCCESS_SUMMARIES_JSON")
+    untrusted_rows=$(jq -c '.untrusted // []' <<< "$SUCCESS_SUMMARIES_JSON")
+
     if [[ "$SUCC_TOTAL" -eq 0 ]]; then
+        print_section "成功登录记录"
         echo "  (无成功登录记录)"
     else
-        printf "  ${C_BOLD}%-6s  %-18s  %-37s  %-22s  %s${C_RESET}\n" \
-            "次数" "来源 IP" "时间区间" "用户" "认证方式"
-        # 以 IP 为主维度聚合: 同一 IP 的所有成功登录折叠为一行,
-        # 列出涉及到的用户名集合 / 认证方式集合, 以及首末时间.
-        # 这样活跃 IP 一眼可见, vscode-server/mosh 等高频重连不会刷屏.
-        awk -F'\t' '
-            {
-                ip = $3
-                if (!(ip in first)) first[ip] = $1
-                last[ip] = $1
-                cnt[ip]++
-                if (!((ip SUBSEP $2) in seen_u)) {
-                    seen_u[ip, $2] = 1
-                    users[ip]   = (ip in users   ? users[ip]   "," $2 : $2)
-                }
-                if (!((ip SUBSEP $4) in seen_m)) {
-                    seen_m[ip, $4] = 1
-                    methods[ip] = (ip in methods ? methods[ip] "," $4 : $4)
-                }
-            }
-            END {
-                for (ip in cnt)
-                    printf "%d\t%s\t%s\t%s\t%s\t%s\n", \
-                        cnt[ip], ip, first[ip], last[ip], users[ip], methods[ip]
-            }
-        ' "$SUCC_TSV" | sort -t $'\t' -k1,1 -rn |
-        while IFS=$'\t' read -r cnt ip first_ts last_ts users methods; do
-            if [[ "$cnt" -gt 1 ]] && [[ "$first_ts" != "$last_ts" ]]; then
-                ts_show="${first_ts} ~ ${last_ts}"
-            else
-                ts_show="$first_ts"
-            fi
-            printf "  ${C_GREEN}%-6s${C_RESET}  %-18s  %-37s  %-22s  %s\n" \
-                "$cnt" "$ip" "$ts_show" "$users" "$methods"
-        done
+        if [[ "$(jq 'length' <<< "$trusted_rows")" -gt 0 ]]; then
+            print_section "可信 IP 成功登录 (仅次数与时间范围)"
+            printf "  ${C_BOLD}%-6s  %-18s  %-37s${C_RESET}\n" "次数" "来源 IP" "时间区间"
+            print_success_summary_rows "$trusted_rows" "$C_CYAN" 1
+        fi
+
+        if [[ "$(jq 'length' <<< "$untrusted_rows")" -gt 0 ]]; then
+            print_section "其它 IP 成功登录 (窗口内汇总)"
+            printf "  ${C_BOLD}%-6s  %-18s  %-37s  %-22s  %s${C_RESET}\n" \
+                "次数" "来源 IP" "时间区间" "用户" "认证方式"
+            print_success_summary_rows "$untrusted_rows" "$C_GREEN"
+        fi
     fi
 fi
 

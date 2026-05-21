@@ -510,6 +510,103 @@ func TestConfigValidateRejectsUnsupportedWebhookScheme(t *testing.T) {
 	}
 }
 
+func TestParseMemoryLimit(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		raw     string
+		want    int64
+		wantErr bool
+	}{
+		{name: "empty disables", raw: "", want: 0},
+		{name: "zero disables", raw: "0", want: 0},
+		{name: "zero bytes disables", raw: "0B", want: 0},
+		{name: "mib suffix", raw: "512MiB", want: 512 << 20},
+		{name: "gib suffix", raw: "1GiB", want: 1 << 30},
+		{name: "decimal mb suffix", raw: "100MB", want: 100 * 1000 * 1000},
+		{name: "short m suffix", raw: "256M", want: 256 << 20},
+		{name: "plain bytes", raw: "1048576", want: 1048576},
+		{name: "whitespace trimmed", raw: " 64MiB ", want: 64 << 20},
+		{name: "negative rejected", raw: "-1MiB", wantErr: true},
+		{name: "invalid suffix", raw: "512XB", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := ParseMemoryLimit(tt.raw)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("ParseMemoryLimit() error = nil, want error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ParseMemoryLimit() error = %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("ParseMemoryLimit() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRuntimeMemoryLimitBytes(t *testing.T) {
+	t.Parallel()
+
+	cfg := RuntimeConfig{MemoryLimit: "128MiB"}
+	got, err := cfg.MemoryLimitBytes()
+	if err != nil {
+		t.Fatalf("MemoryLimitBytes() error = %v", err)
+	}
+	if got != 128<<20 {
+		t.Fatalf("MemoryLimitBytes() = %d, want %d", got, 128<<20)
+	}
+}
+
+func TestConfigValidateRejectsInvalidRuntimeMemoryLimit(t *testing.T) {
+	t.Parallel()
+
+	cfg := defaultConfig()
+	cfg.Runtime.MemoryLimit = "not-a-limit"
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("Validate() error = nil, want error")
+	}
+	if !strings.Contains(err.Error(), "runtime.memory_limit") {
+		t.Fatalf("Validate() error = %v, want runtime.memory_limit", err)
+	}
+}
+
+func TestLoadParsesRuntimeMemoryLimit(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := dir + "/config.yaml"
+	data := []byte("runtime:\n  memory_limit: \"256MiB\"\n")
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Runtime.MemoryLimit != "256MiB" {
+		t.Fatalf("Load().Runtime.MemoryLimit = %q, want %q", cfg.Runtime.MemoryLimit, "256MiB")
+	}
+	limit, err := cfg.Runtime.MemoryLimitBytes()
+	if err != nil {
+		t.Fatalf("MemoryLimitBytes() error = %v", err)
+	}
+	if limit != 256<<20 {
+		t.Fatalf("MemoryLimitBytes() = %d, want %d", limit, 256<<20)
+	}
+}
+
 func stringPtr(value string) *string {
 	return &value
 }

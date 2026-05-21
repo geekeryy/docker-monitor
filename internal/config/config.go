@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -17,6 +18,15 @@ type Config struct {
 	Aggregation AggregationConfig `yaml:"aggregation"`
 	DingTalk    DingTalkConfig    `yaml:"dingtalk"`
 	Storage     StorageConfig     `yaml:"storage"`
+	Runtime     RuntimeConfig     `yaml:"runtime"`
+}
+
+// RuntimeConfig controls Go runtime behavior for the monitor process.
+type RuntimeConfig struct {
+	// MemoryLimit sets a soft heap limit via debug.SetMemoryLimit at startup.
+	// Accepts the same suffixes as GOMEMLIMIT (MiB, GiB, MB, etc.).
+	// Empty, "0", or "0B" disables the limit.
+	MemoryLimit string `yaml:"memory_limit"`
 }
 
 type DockerConfig struct {
@@ -64,6 +74,8 @@ type AggregationOverrideConfig struct {
 	FlushSize           *int    `yaml:"flush_size"`
 	FlushInterval       *string `yaml:"flush_interval"`
 	UnknownLogID        *string `yaml:"unknown_log_id"`
+	MaxGroups           *int    `yaml:"max_groups"`
+	GroupTTL            *string `yaml:"group_ttl"`
 	BackfillThreshold   *string `yaml:"backfill_threshold"`
 	BackfillMaxDuration *string `yaml:"backfill_max_duration"`
 }
@@ -199,6 +211,13 @@ type AggregationConfig struct {
 	FlushSize     int    `yaml:"flush_size"`
 	FlushInterval string `yaml:"flush_interval"`
 	UnknownLogID  string `yaml:"unknown_log_id"`
+	// MaxGroups caps in-memory aggregation groups keyed by log_id. Only
+	// non-alert groups participate in LRU eviction when the cap is exceeded.
+	// Zero disables the cap.
+	MaxGroups int `yaml:"max_groups"`
+	// GroupTTL evicts non-alert groups that have not received new events within
+	// this duration. Zero or empty disables TTL eviction.
+	GroupTTL string `yaml:"group_ttl"`
 	// BackfillThreshold controls the minimum disconnect duration that triggers
 	// the watcher's backfill mode. While in backfill, replayed historical
 	// alerts are persisted to disk but are NOT forwarded to alert sinks
@@ -277,6 +296,8 @@ func defaultConfig() Config {
 			FlushSize:           20,
 			FlushInterval:       "10s",
 			UnknownLogID:        "unknown",
+			MaxGroups:           10000,
+			GroupTTL:            "30m",
 			BackfillThreshold:   "5m",
 			BackfillMaxDuration: "30m",
 		},
@@ -318,6 +339,12 @@ func (c Config) validateResolved() error {
 	if _, err := c.BackfillMaxDurationDuration(); err != nil {
 		return err
 	}
+	if _, err := c.GroupTTLDuration(); err != nil {
+		return err
+	}
+	if c.Aggregation.MaxGroups < 0 {
+		return errors.New("aggregation.max_groups must be >= 0")
+	}
 	if _, err := c.ExcludeChainTTLDuration(); err != nil {
 		return err
 	}
@@ -332,6 +359,9 @@ func (c Config) validateResolved() error {
 	}
 	if c.DingTalk.MaxEvents <= 0 {
 		return errors.New("dingtalk.max_events must be greater than 0")
+	}
+	if _, err := c.Runtime.MemoryLimitBytes(); err != nil {
+		return err
 	}
 	return nil
 }
@@ -367,6 +397,22 @@ func (c Config) FlushIntervalDuration() (time.Duration, error) {
 	d, err := time.ParseDuration(c.Aggregation.FlushInterval)
 	if err != nil {
 		return 0, fmt.Errorf("parse aggregation.flush_interval: %w", err)
+	}
+	return d, nil
+}
+
+// GroupTTLDuration parses aggregation.group_ttl. Zero disables TTL eviction.
+func (c Config) GroupTTLDuration() (time.Duration, error) {
+	value := strings.TrimSpace(c.Aggregation.GroupTTL)
+	if value == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(value)
+	if err != nil {
+		return 0, fmt.Errorf("parse aggregation.group_ttl: %w", err)
+	}
+	if d < 0 {
+		return 0, fmt.Errorf("aggregation.group_ttl must be >= 0")
 	}
 	return d, nil
 }
@@ -566,6 +612,12 @@ func applyAggregationOverrides(dst *AggregationConfig, override *AggregationOver
 	if override.UnknownLogID != nil {
 		dst.UnknownLogID = *override.UnknownLogID
 	}
+	if override.MaxGroups != nil {
+		dst.MaxGroups = *override.MaxGroups
+	}
+	if override.GroupTTL != nil {
+		dst.GroupTTL = *override.GroupTTL
+	}
 	if override.BackfillThreshold != nil {
 		dst.BackfillThreshold = *override.BackfillThreshold
 	}
@@ -606,4 +658,74 @@ func hostDisplayName(host string) string {
 		return "local"
 	}
 	return host
+}
+
+// MemoryLimitBytes parses runtime.memory_limit. Zero means unlimited.
+func (c RuntimeConfig) MemoryLimitBytes() (int64, error) {
+	return ParseMemoryLimit(c.MemoryLimit)
+}
+
+// ParseMemoryLimit parses a GOMEMLIMIT-style memory limit string.
+// Empty, "0", or "0B" returns 0 (unlimited). Supported suffixes match Go
+// runtime: B, KB/K/KiB/Ki, MB/M/MiB/Mi, GB/G/GiB/Gi, TB/T/TiB/Ti.
+func ParseMemoryLimit(raw string) (int64, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || raw == "0" {
+		return 0, nil
+	}
+
+	type unit struct {
+		suffix string
+		bytes  int64
+	}
+	units := []unit{
+		{"TiB", 1 << 40},
+		{"GiB", 1 << 30},
+		{"MiB", 1 << 20},
+		{"KiB", 1 << 10},
+		{"TB", 1000 * 1000 * 1000 * 1000},
+		{"GB", 1000 * 1000 * 1000},
+		{"MB", 1000 * 1000},
+		{"KB", 1000},
+		{"Ti", 1 << 40},
+		{"Gi", 1 << 30},
+		{"Mi", 1 << 20},
+		{"Ki", 1 << 10},
+		{"T", 1 << 40},
+		{"G", 1 << 30},
+		{"M", 1 << 20},
+		{"K", 1 << 10},
+		{"B", 1},
+	}
+
+	upper := strings.ToUpper(raw)
+	for _, u := range units {
+		if strings.HasSuffix(upper, strings.ToUpper(u.suffix)) {
+			numStr := strings.TrimSpace(raw[:len(raw)-len(u.suffix)])
+			if numStr == "" {
+				return 0, fmt.Errorf("parse runtime.memory_limit %q: missing numeric value", raw)
+			}
+			value, err := strconv.ParseFloat(numStr, 64)
+			if err != nil {
+				return 0, fmt.Errorf("parse runtime.memory_limit %q: %w", raw, err)
+			}
+			if value < 0 {
+				return 0, fmt.Errorf("runtime.memory_limit must be >= 0")
+			}
+			limit := int64(value * float64(u.bytes))
+			if limit == 0 {
+				return 0, nil
+			}
+			return limit, nil
+		}
+	}
+
+	value, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("parse runtime.memory_limit %q: %w", raw, err)
+	}
+	if value < 0 {
+		return 0, fmt.Errorf("runtime.memory_limit must be >= 0")
+	}
+	return value, nil
 }

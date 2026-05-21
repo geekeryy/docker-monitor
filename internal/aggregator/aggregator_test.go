@@ -25,7 +25,7 @@ func TestAggregatorFlushesOnSize(t *testing.T) {
 	t.Parallel()
 
 	store := &memoryStore{}
-	agg := New(store, 2, time.Minute, "unknown")
+	agg := New(store, 2, time.Minute, "unknown", 0, 0)
 
 	first := model.LogEvent{
 		Timestamp:    time.Unix(10, 0).UTC(),
@@ -62,7 +62,7 @@ func TestAggregatorFlushAll(t *testing.T) {
 	t.Parallel()
 
 	store := &memoryStore{}
-	agg := New(store, 10, time.Minute, "unknown")
+	agg := New(store, 10, time.Minute, "unknown", 0, 0)
 
 	if err := agg.Add(context.Background(), model.LogEvent{
 		Timestamp:    time.Unix(20, 0).UTC(),
@@ -88,7 +88,7 @@ func TestAggregatorFlushesAllLogsOnceAlertAppears(t *testing.T) {
 	t.Parallel()
 
 	store := &memoryStore{}
-	agg := New(store, 2, time.Minute, "unknown")
+	agg := New(store, 2, time.Minute, "unknown", 0, 0)
 
 	first := model.LogEvent{
 		Timestamp:    time.Unix(30, 0).UTC(),
@@ -131,7 +131,7 @@ func TestAggregatorSortsEventsByTimestampInBatch(t *testing.T) {
 	t.Parallel()
 
 	store := &memoryStore{}
-	agg := New(store, 2, time.Minute, "unknown")
+	agg := New(store, 2, time.Minute, "unknown", 0, 0)
 
 	later := model.LogEvent{
 		Timestamp:    time.Unix(101, 0).UTC(),
@@ -173,7 +173,7 @@ func TestAggregatorDropsGroupsWithoutAlertOnFlush(t *testing.T) {
 	t.Parallel()
 
 	store := &memoryStore{}
-	agg := New(store, 10, time.Minute, "unknown")
+	agg := New(store, 10, time.Minute, "unknown", 0, 0)
 
 	if err := agg.Add(context.Background(), model.LogEvent{
 		Timestamp:    time.Unix(50, 0).UTC(),
@@ -196,7 +196,7 @@ func TestAggregatorFlushesUnknownLogIDIndividually(t *testing.T) {
 	t.Parallel()
 
 	store := &memoryStore{}
-	agg := New(store, 20, time.Minute, "unknown")
+	agg := New(store, 20, time.Minute, "unknown", 0, 0)
 
 	first := model.LogEvent{
 		Timestamp:    time.Unix(60, 0).UTC(),
@@ -242,7 +242,7 @@ func TestAggregatorBackfillModeSuppressesAlertSinksAndCountsAlerts(t *testing.T)
 	t.Parallel()
 
 	store := &memoryStore{}
-	agg := New(store, 2, time.Minute, "unknown")
+	agg := New(store, 2, time.Minute, "unknown", 0, 0)
 
 	agg.EnterBackfill()
 	if !agg.IsBackfilling() {
@@ -324,7 +324,7 @@ func TestAggregatorBackfillModeRefcountedAcrossStreams(t *testing.T) {
 	t.Parallel()
 
 	store := &memoryStore{}
-	agg := New(store, 10, time.Minute, "unknown")
+	agg := New(store, 10, time.Minute, "unknown", 0, 0)
 
 	agg.EnterBackfill()
 	agg.EnterBackfill()
@@ -367,7 +367,7 @@ func TestAggregatorExitBackfillToleratesUnderflow(t *testing.T) {
 	t.Parallel()
 
 	store := &memoryStore{}
-	agg := New(store, 10, time.Minute, "unknown")
+	agg := New(store, 10, time.Minute, "unknown", 0, 0)
 
 	if got := agg.ExitBackfill(); got != 0 {
 		t.Fatalf("ExitBackfill() = %d, want 0 when no backfill active", got)
@@ -381,7 +381,7 @@ func TestAggregatorBoundsBufferedEventsForKnownLogIDWithoutAlert(t *testing.T) {
 	t.Parallel()
 
 	store := &memoryStore{}
-	agg := New(store, 2, time.Minute, "unknown")
+	agg := New(store, 2, time.Minute, "unknown", 0, 0)
 
 	for i := 0; i < 25; i++ {
 		err := agg.Add(context.Background(), model.LogEvent{
@@ -398,12 +398,106 @@ func TestAggregatorBoundsBufferedEventsForKnownLogIDWithoutAlert(t *testing.T) {
 
 	buffer := agg.groups["known-id"]
 	if buffer == nil {
-		t.Fatal("buffer for known-id = nil, want retained context")
+		t.Fatal("buffer for known-id = nil, want group recreated after full-buffer eviction")
 	}
-	if got, want := len(buffer.events), agg.maxGroupSize; got != want {
+	if got, want := len(buffer.events), 5; got != want {
 		t.Fatalf("len(buffer.events) = %d, want %d", got, want)
 	}
-	if got := buffer.events[0].Timestamp; !got.Equal(time.Unix(5, 0).UTC()) {
-		t.Fatalf("first retained timestamp = %s, want %s", got, time.Unix(5, 0).UTC())
+	if got := buffer.events[0].Timestamp; !got.Equal(time.Unix(20, 0).UTC()) {
+		t.Fatalf("first retained timestamp = %s, want %s", got, time.Unix(20, 0).UTC())
+	}
+}
+func TestAggregatorEvictsNonAlertGroupAfterTTL(t *testing.T) {
+	t.Parallel()
+
+	store := &memoryStore{}
+	now := time.Unix(1000, 0).UTC()
+	agg := New(store, 10, time.Minute, "unknown", 0, time.Minute)
+	agg.SetNowFunc(func() time.Time { return now })
+
+	err := agg.Add(context.Background(), model.LogEvent{
+		Timestamp:    now,
+		LogID:        "idle-id",
+		AlertMatched: false,
+		Container:    model.ContainerInfo{Name: "app-1"},
+	})
+	if err != nil {
+		t.Fatalf("Add() error = %v", err)
+	}
+	if _, ok := agg.groups["idle-id"]; !ok {
+		t.Fatal("group idle-id should exist before TTL expires")
+	}
+
+	now = now.Add(time.Minute)
+	if err := agg.FlushAll(context.Background()); err != nil {
+		t.Fatalf("FlushAll() error = %v", err)
+	}
+	if _, ok := agg.groups["idle-id"]; ok {
+		t.Fatal("group idle-id should be evicted after TTL")
+	}
+}
+
+func TestAggregatorEvictsOldestNonAlertGroupsWhenMaxGroupsExceeded(t *testing.T) {
+	t.Parallel()
+
+	store := &memoryStore{}
+	base := time.Unix(2000, 0).UTC()
+	agg := New(store, 10, time.Minute, "unknown", 2, 0)
+	current := base
+	agg.SetNowFunc(func() time.Time { return current })
+
+	for i, id := range []string{"oldest", "middle", "newest"} {
+		current = base.Add(time.Duration(i) * time.Second)
+		if err := agg.Add(context.Background(), model.LogEvent{
+			Timestamp:    current,
+			LogID:        id,
+			AlertMatched: false,
+			Container:    model.ContainerInfo{Name: "app-1"},
+		}); err != nil {
+			t.Fatalf("Add(%q) error = %v", id, err)
+		}
+	}
+
+	if got := len(agg.groups); got != 2 {
+		t.Fatalf("len(agg.groups) = %d, want 2", got)
+	}
+	if _, ok := agg.groups["oldest"]; ok {
+		t.Fatal("oldest non-alert group should be evicted")
+	}
+	if _, ok := agg.groups["middle"]; !ok {
+		t.Fatal("middle group should remain")
+	}
+	if _, ok := agg.groups["newest"]; !ok {
+		t.Fatal("newest group should remain")
+	}
+}
+
+func TestAggregatorRetainsAlertGroupsDespiteTTL(t *testing.T) {
+	t.Parallel()
+
+	store := &memoryStore{}
+	now := time.Unix(3000, 0).UTC()
+	agg := New(store, 10, time.Minute, "unknown", 0, time.Minute)
+	agg.SetNowFunc(func() time.Time { return now })
+
+	if err := agg.Add(context.Background(), model.LogEvent{
+		Timestamp:    now,
+		LogID:        "alert-id",
+		AlertMatched: true,
+		Level:        "WARN",
+		Container:    model.ContainerInfo{Name: "app-1"},
+	}); err != nil {
+		t.Fatalf("Add() error = %v", err)
+	}
+
+	now = now.Add(2 * time.Minute)
+	if err := agg.FlushAll(context.Background()); err != nil {
+		t.Fatalf("FlushAll() error = %v", err)
+	}
+	if len(store.batches) != 1 {
+		t.Fatalf("len(store.batches) = %d, want 1", len(store.batches))
+	}
+	if store.batches[0].LogID != "alert-id" {
+		t.Fatalf("batch.LogID = %q, want alert-id", store.batches[0].LogID)
 	}
 }

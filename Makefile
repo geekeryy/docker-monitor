@@ -7,6 +7,7 @@ ALPINE_IMAGE ?= docker.io/library/alpine:3.22
 
 # docker buildx use container-builder
 # docker buildx create --name container-builder --driver docker-container --bootstrap --use
+# If build fails with "no space left on device", prune buildx cache: docker buildx prune -af
 build-image:
 	docker buildx build --push --platform $(PLATFORMS) --build-arg GO_IMAGE=$(GO_IMAGE) --build-arg ALPINE_IMAGE=$(ALPINE_IMAGE) -t $(IMAGE) -f Dockerfile .
 	docker pull $(IMAGE)

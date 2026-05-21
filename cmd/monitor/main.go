@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"syscall"
@@ -37,6 +38,10 @@ func run() error {
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {
+		return err
+	}
+
+	if err := applyRuntimeMemoryLimit(cfg, logger); err != nil {
 		return err
 	}
 
@@ -195,6 +200,11 @@ func newMonitorInstance(ctx context.Context, hostConfig config.ResolvedHostConfi
 		_ = client.Close()
 		return monitorInstance{}, err
 	}
+	groupTTL, err := cfg.GroupTTLDuration()
+	if err != nil {
+		_ = client.Close()
+		return monitorInstance{}, err
+	}
 
 	outputStore := store.NewMultiStore(
 		store.NewFileStore(cfg.Storage.OutputDir),
@@ -220,7 +230,14 @@ func newMonitorInstance(ctx context.Context, hostConfig config.ResolvedHostConfi
 		return monitorInstance{}, err
 	}
 
-	logAggregator := aggregator.New(outputStore, cfg.Aggregation.FlushSize, flushInterval, cfg.Aggregation.UnknownLogID)
+	logAggregator := aggregator.New(
+		outputStore,
+		cfg.Aggregation.FlushSize,
+		flushInterval,
+		cfg.Aggregation.UnknownLogID,
+		cfg.Aggregation.MaxGroups,
+		groupTTL,
+	)
 	logReader := dockermonitor.NewLogReader(client)
 	watcher := dockermonitor.NewWatcher(client, logReader, cfg.Docker.IncludePatterns, selfContainerID, monitorStartedAt, sinceDuration, func(streamCtx context.Context, raw model.RawLog) error {
 		if multiHost {
@@ -363,4 +380,28 @@ func newDockerClient(host string) (*dockermonitor.Client, error) {
 		return nil, fmt.Errorf("create docker client: %w", err)
 	}
 	return client, nil
+}
+
+func applyRuntimeMemoryLimit(cfg config.Config, logger *slog.Logger) error {
+	if strings.TrimSpace(os.Getenv("GOMEMLIMIT")) != "" {
+		logger.Info("process memory limit from GOMEMLIMIT environment variable",
+			slog.String("gomemlimit", strings.TrimSpace(os.Getenv("GOMEMLIMIT"))),
+		)
+		return nil
+	}
+
+	limit, err := cfg.Runtime.MemoryLimitBytes()
+	if err != nil {
+		return err
+	}
+	if limit == 0 {
+		return nil
+	}
+
+	prev := debug.SetMemoryLimit(limit)
+	logger.Info("process memory limit applied from config",
+		slog.Int64("limit_bytes", limit),
+		slog.Int64("previous_limit_bytes", prev),
+	)
+	return nil
 }

@@ -43,6 +43,11 @@ aggregation:
   flush_size: 20
   flush_interval: "10s"
   unknown_log_id: "unknown"
+  max_groups: 10000      # 无告警分组数量上限，0=不限制
+  group_ttl: "1m"       # 无告警分组空闲过期时间，0s=关闭
+
+runtime:
+  memory_limit: "512MiB"  # Go 进程软内存上限，0 或空表示不限制；GOMEMLIMIT 环境变量优先
 
 dingtalk:
   webhook_url: ""

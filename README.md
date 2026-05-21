@@ -133,6 +133,39 @@ docker run --rm \
 
 如果你需要推送钉钉，确保容器所在环境可以访问公网。
 
+### 容器内存限制
+
+内存控制分三层，作用范围不同：
+
+| 层级 | 配置方式 | 作用 |
+|------|----------|------|
+| 应用内聚合缓存 | `aggregation.max_groups` / `group_ttl` | 限制内存中 log_id 分组 map 的增长 |
+| Go 进程软上限 | `runtime.memory_limit` 或 `GOMEMLIMIT` 环境变量 | 触发 GC 以控制 Go 堆内存，OOM 前尽量回收 |
+| 容器硬上限 | Docker `mem_limit` / `--memory` | 超出后内核 OOM killer 直接终止容器 |
+
+**推荐组合**：容器 limit 略高于进程 limit（约 10% headroom），让 Go runtime 有机会在触达容器上限前主动 GC。
+
+```yaml
+runtime:
+  memory_limit: "512MiB"  # 本地运行时生效；0 或空表示不限制
+```
+
+```bash
+# docker compose（默认容器 512m、进程 460MiB，均可通过环境变量覆盖）
+export MONITOR_MEMORY_LIMIT=512m      # 容器硬上限
+export MONITOR_GOMEMLIMIT=460MiB      # Go 进程软上限，建议低于容器 limit
+docker compose up -d
+
+# docker run 示例
+docker run --rm --memory=512m -e GOMEMLIMIT=460MiB \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v "$(pwd)/configs:/app/configs" \
+  -v "$(pwd)/data:/app/data" \
+  docker-monitor:local
+```
+
+优先级：`GOMEMLIMIT` 环境变量 > `runtime.memory_limit` 配置项。Docker Compose 默认注入 `GOMEMLIMIT`，因此容器部署时通常无需改 config.yaml。
+
 ## 配置说明
 
 完整示例：
@@ -179,6 +212,11 @@ aggregation:
   flush_size: 20
   flush_interval: "10s"
   unknown_log_id: "unknown"
+  max_groups: 10000
+  group_ttl: "30m"
+
+runtime:
+  memory_limit: "512MiB"
 
 dingtalk:
   webhook_url: ""
@@ -315,11 +353,19 @@ filters:
 - `flush_size`: 单个 `log_id` 聚合到多少条后立即输出
 - `flush_interval`: 定时刷盘间隔
 - `unknown_log_id`: 告警日志未提取到标识时使用的占位值
+- `max_groups`: 内存中最多保留的无告警聚合分组数；超出后按 LRU 淘汰最久未更新的无告警分组，`0` 表示不限制
+- `group_ttl`: 无告警分组空闲超过该时长后自动淘汰，`0s` 或留空表示关闭
 
 建议：
 
 - 日志量大、重复告警多时，增大 `flush_size`
 - 希望更快看到聚合结果时，减小 `flush_interval`
+- 容器日志量大且 log_id 种类多时，适当调小 `max_groups` 或缩短 `group_ttl` 以控制内存
+
+### `runtime`
+
+- `memory_limit`: Go 进程软内存上限，启动时通过 `debug.SetMemoryLimit` 生效；格式与 `GOMEMLIMIT` 相同（如 `512MiB`、`1GiB`）。`0` 或留空表示不限制
+- 若已设置 `GOMEMLIMIT` 环境变量，则环境变量优先，忽略此项
 
 ### `dingtalk`
 

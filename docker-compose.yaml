@@ -2,6 +2,11 @@ services:
   monitor:
     image: docker.io/geekeryy/docker-monitor:latest
     restart: unless-stopped
+    # 容器内存硬上限，可通过 MONITOR_MEMORY_LIMIT 覆盖（默认 512m）
+    mem_limit: ${MONITOR_MEMORY_LIMIT:-512m}
+    # Go 进程软内存上限；默认 460MiB，建议比 mem_limit 低 10% 左右留 headroom
+    environment:
+      GOMEMLIMIT: ${MONITOR_GOMEMLIMIT:-460MiB}
     volumes:
       - .dev.config.yaml:/app/configs/config.yaml
       - ./data:/app/data

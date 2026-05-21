@@ -1,0 +1,26 @@
+# Runtime/test data — mounted at runtime via volume, not baked into image
+data/
+
+# VCS & editor
+.git/
+.gitignore
+.cursorignore
+
+# Local dev & compose (not needed in image)
+.dev.config.yaml
+docker-compose.yaml
+
+# Build artifacts & OS junk
+*.exe
+*.test
+*.out
+.DS_Store
+tmp/
+temp/
+*.log
+logs/
+
+# Docs & tooling not needed for go build
+README.md
+Makefile
+scripts/
