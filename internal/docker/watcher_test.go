@@ -161,6 +161,86 @@ func TestWatcherHandleEventIgnoresSelfContainer(t *testing.T) {
 	}
 }
 
+func TestWatcherPreservesLogCursorAcrossContainerRestart(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	monitorStartedAt := time.Date(2026, 3, 24, 10, 0, 0, 0, time.UTC)
+	lastSeen := monitorStartedAt.Add(2 * time.Minute)
+	line := fmt.Sprintf("%s ERROR first failure\n", lastSeen.Format(time.RFC3339Nano))
+
+	var calls atomic.Int32
+	callsCh := make(chan containerLogsCall, 2)
+	handled := make(chan struct{}, 1)
+	logsClient := &funcLogsClient{
+		fn: func(ctx context.Context, containerID string, options ContainerLogsOptions) (io.ReadCloser, error) {
+			callsCh <- containerLogsCall{containerID: containerID, options: options}
+			if calls.Add(1) == 1 {
+				return io.NopCloser(io.MultiReader(
+					strings.NewReader(line),
+					&contextBoundReadCloser{ctx: ctx},
+				)), nil
+			}
+			return &contextBoundReadCloser{ctx: ctx}, nil
+		},
+	}
+	watcher := NewWatcher(
+		&staticDiscoveryClient{},
+		NewLogReader(logsClient),
+		[]string{"api"},
+		"",
+		monitorStartedAt,
+		0,
+		func(context.Context, model.RawLog) error {
+			select {
+			case handled <- struct{}{}:
+			default:
+			}
+			return nil
+		},
+		slog.Default(),
+	)
+
+	watcher.maybeStart(ctx, ContainerSummary{
+		ID:    "container-id",
+		Names: []string{"/api"},
+	})
+
+	firstCall := waitForContainerLogsDetailedCall(t, callsCh)
+	if firstCall.containerID != "container-id" {
+		t.Fatalf("first ContainerLogs called for %q, want container-id", firstCall.containerID)
+	}
+	if firstCall.options.Since != FormatSince(monitorStartedAt) {
+		t.Fatalf("first ContainerLogs since = %q, want %q", firstCall.options.Since, FormatSince(monitorStartedAt))
+	}
+	waitForHandledLog(t, handled)
+
+	watcher.handleEvent(ctx, EventMessage{
+		ID:     "container-id",
+		Action: "stop",
+		Actor: EventActor{
+			Attributes: map[string]string{"name": "api"},
+		},
+	})
+	watcher.handleEvent(ctx, EventMessage{
+		ID:     "container-id",
+		Action: "start",
+		Actor: EventActor{
+			Attributes: map[string]string{"name": "api"},
+		},
+	})
+
+	secondCall := waitForContainerLogsDetailedCall(t, callsCh)
+	if secondCall.containerID != "container-id" {
+		t.Fatalf("second ContainerLogs called for %q, want container-id", secondCall.containerID)
+	}
+	if secondCall.options.Since != FormatSince(lastSeen) {
+		t.Fatalf("second ContainerLogs since = %q, want last seen %q", secondCall.options.Since, FormatSince(lastSeen))
+	}
+}
+
 func TestWatcherReattachesWhenContainerRecreatedWithSameName(t *testing.T) {
 	t.Parallel()
 
@@ -1357,6 +1437,11 @@ func (c *sequenceLogsClient) ContainerLogs(ctx context.Context, containerID stri
 	return readerFactory(ctx), nil
 }
 
+type containerLogsCall struct {
+	containerID string
+	options     ContainerLogsOptions
+}
+
 type contextBoundReadCloser struct {
 	ctx context.Context
 }
@@ -1380,6 +1465,28 @@ func waitForContainerLogsCall(t *testing.T, calls <-chan string, want string) {
 		}
 	case <-time.After(time.Second):
 		t.Fatalf("timed out waiting for ContainerLogs(%q)", want)
+	}
+}
+
+func waitForContainerLogsDetailedCall(t *testing.T, calls <-chan containerLogsCall) containerLogsCall {
+	t.Helper()
+
+	select {
+	case got := <-calls:
+		return got
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for ContainerLogs call")
+	}
+	return containerLogsCall{}
+}
+
+func waitForHandledLog(t *testing.T, handled <-chan struct{}) {
+	t.Helper()
+
+	select {
+	case <-handled:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for log handler")
 	}
 }
 

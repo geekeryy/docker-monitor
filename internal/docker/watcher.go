@@ -34,10 +34,11 @@ type Watcher struct {
 	handler                LineHandler
 	logger                 *slog.Logger
 
-	mu     sync.Mutex
-	active map[string]activeStream
-	ids    map[string]string
-	wg     sync.WaitGroup
+	mu      sync.Mutex
+	active  map[string]activeStream
+	ids     map[string]string
+	cursors map[string]time.Time
+	wg      sync.WaitGroup
 
 	backfillController    BackfillController
 	backfillThreshold     time.Duration
@@ -117,6 +118,7 @@ func NewWatcher(client DiscoveryClient, reader *LogReader, includePatterns []str
 		logger:                 logger,
 		active:                 make(map[string]activeStream),
 		ids:                    make(map[string]string),
+		cursors:                make(map[string]time.Time),
 	}
 }
 
@@ -434,10 +436,7 @@ func (w *Watcher) maybeStart(ctx context.Context, summary ContainerSummary) {
 func (w *Watcher) runStream(rootCtx, ctx context.Context, info model.ContainerInfo) {
 	defer w.removeActive(info.Name, info.ID)
 
-	lastSeen := w.startedAt
-	if w.initialSince > 0 {
-		lastSeen = w.startedAt.Add(-w.initialSince)
-	}
+	lastSeen := w.initialLogSince(info)
 
 	var (
 		disconnectedSince time.Time
@@ -449,8 +448,9 @@ func (w *Watcher) runStream(rootCtx, ctx context.Context, info model.ContainerIn
 			w.endStreamBackfill(streamCtx, backfill, "log stream caught up to realtime")
 			backfill = nil
 		}
-		if !raw.Timestamp.IsZero() {
+		if !raw.Timestamp.IsZero() && raw.Timestamp.After(lastSeen) {
 			lastSeen = raw.Timestamp
+			w.recordLogTimestamp(info, raw.Timestamp)
 		}
 		return w.handler(streamCtx, raw)
 	}
@@ -717,6 +717,49 @@ func (w *Watcher) stopAll() {
 	for _, cancel := range streams {
 		cancel()
 	}
+}
+
+func (w *Watcher) initialLogSince(info model.ContainerInfo) time.Time {
+	since := w.startedAt
+	if w.initialSince > 0 {
+		since = w.startedAt.Add(-w.initialSince)
+	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	for _, key := range cursorKeys(info) {
+		if ts := w.cursors[key]; ts.After(since) {
+			since = ts
+		}
+	}
+	return since
+}
+
+func (w *Watcher) recordLogTimestamp(info model.ContainerInfo, timestamp time.Time) {
+	if timestamp.IsZero() {
+		return
+	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	for _, key := range cursorKeys(info) {
+		if previous := w.cursors[key]; previous.IsZero() || timestamp.After(previous) {
+			w.cursors[key] = timestamp
+		}
+	}
+}
+
+func cursorKeys(info model.ContainerInfo) []string {
+	keys := make([]string, 0, 2)
+	if id := strings.TrimSpace(info.ID); id != "" {
+		keys = append(keys, "id:"+id)
+	}
+	if name := strings.TrimSpace(info.Name); name != "" {
+		keys = append(keys, "name:"+name)
+	}
+	return keys
 }
 
 func MatchAny(name string, patterns []string) bool {
